@@ -1,6 +1,7 @@
 // Copyright 2020 New Relic Corporation. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+//go:build go1.8
 // +build go1.8
 
 package awssupport
@@ -10,7 +11,8 @@ import (
 	"net/http"
 	"reflect"
 
-	"github.com/newrelic/go-agent/v3/internal/integrationsupport"
+	"github.com/newrelic/go-agent/v3/newrelic/integrationsupport"
+
 	newrelic "github.com/newrelic/go-agent/v3/newrelic"
 )
 
@@ -83,7 +85,12 @@ func StartSegment(input StartSegmentInputs) *http.Request {
 			StartTime:          txn.StartSegmentNow(),
 		}
 	} else {
-		segment = newrelic.StartExternalSegment(txn, input.HTTPRequest)
+		// Do NOT set any distributed trace headers.
+		// Doing so can cause the AWS SDK's request signature to be invalid on retries.
+		segment = &newrelic.ExternalSegment{
+			Request:   input.HTTPRequest,
+			StartTime: txn.StartSegmentNow(),
+		}
 	}
 
 	integrationsupport.AddAgentSpanAttribute(txn, newrelic.SpanAttributeAWSOperation, input.Operation)
@@ -94,11 +101,16 @@ func StartSegment(input StartSegmentInputs) *http.Request {
 }
 
 // EndSegment will end any segment found in the given context.
-func EndSegment(ctx context.Context, hdr http.Header) {
+func EndSegment(ctx context.Context, resp *http.Response) {
 	if segment, ok := ctx.Value(segmentContextKey).(endable); ok {
-		if id := GetRequestID(hdr); "" != id {
-			txn := newrelic.FromContext(ctx)
-			integrationsupport.AddAgentSpanAttribute(txn, newrelic.SpanAttributeAWSRequestID, id)
+		if resp != nil {
+			if extSegment, ok := segment.(*newrelic.ExternalSegment); ok {
+				extSegment.Response = resp
+			}
+			if requestID := GetRequestID(resp.Header); requestID != "" {
+				txn := newrelic.FromContext(ctx)
+				integrationsupport.AddAgentSpanAttribute(txn, newrelic.SpanAttributeAWSRequestID, requestID)
+			}
 		}
 		segment.End()
 	}

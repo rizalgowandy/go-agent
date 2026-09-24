@@ -4,6 +4,7 @@
 package newrelic
 
 import (
+	"compress/gzip"
 	"errors"
 	"fmt"
 	"io"
@@ -62,25 +63,48 @@ type app struct {
 	// (disconnect, license exception, shutdown).
 	err error
 
+	// registered callback functions
+	llmTokenCountCallback func(string, string) int
+
+	// high water mark alarms
+	heapHighWaterMarkAlarms heapHighWaterMarkAlarmSet
+
+	// profiler
+	profiler profilerConfig
+
 	serverless *serverlessHarvest
 }
 
 func (app *app) doHarvest(h *harvest, harvestStart time.Time, run *appRun) {
-	h.CreateFinalMetrics(run.Reply, run.harvestConfig, app.getObserver())
+	h.CreateFinalMetrics(run, app.getObserver())
 
 	payloads := h.Payloads(app.config.DistributedTracer.Enabled)
 	for _, p := range payloads {
 		cmd := p.EndpointMethod()
+		var data []byte
+
+		defer func() {
+			if r := recover(); r != nil {
+				app.Warn("panic occurred when creating harvest data", map[string]interface{}{
+					"cmd":   cmd,
+					"panic": r,
+				})
+
+				// make sure the loop continues
+				data = nil
+			}
+		}()
+
 		data, err := p.Data(run.Reply.RunID.String(), harvestStart)
 
-		if nil != err {
+		if err != nil {
 			app.Warn("unable to create harvest data", map[string]interface{}{
 				"cmd":   cmd,
 				"error": err.Error(),
 			})
 			continue
 		}
-		if nil == data {
+		if data == nil {
 			continue
 		}
 
@@ -97,16 +121,16 @@ func (app *app) doHarvest(h *harvest, harvestStart time.Time, run *appRun) {
 
 		if resp.IsDisconnect() || resp.IsRestartException() {
 			select {
-			case app.collectorErrorChan <- resp:
+			case app.collectorErrorChan <- *resp:
 			case <-app.shutdownStarted:
 			}
 			return
 		}
 
-		if nil != resp.Err {
+		if resp.GetError() != nil {
 			app.Warn("harvest failure", map[string]interface{}{
 				"cmd":         cmd,
-				"error":       resp.Err.Error(),
+				"error":       resp.GetError().Error(),
 				"retain_data": resp.ShouldSaveHarvestData(),
 			})
 		}
@@ -132,15 +156,15 @@ func (app *app) connectRoutine() {
 
 		if resp.IsDisconnect() {
 			select {
-			case app.collectorErrorChan <- resp:
+			case app.collectorErrorChan <- *resp:
 			case <-app.shutdownStarted:
 			}
 			return
 		}
 
-		if nil != resp.Err {
+		if nil != resp.GetError() {
 			app.Warn("application connect failure", map[string]interface{}{
-				"error": resp.Err.Error(),
+				"error": resp.GetError().Error(),
 			})
 		}
 
@@ -237,7 +261,7 @@ func (app *app) process() {
 
 			// Remove the run before merging any final data to
 			// ensure a bounded number of receives from dataChan.
-			app.setState(nil, errors.New("application shut down"))
+			app.setState(nil, errApplicationShutDown)
 
 			if obs := app.getObserver(); obs != nil {
 				if err := obs.shutdown(timeout); err != nil {
@@ -263,6 +287,7 @@ func (app *app) process() {
 
 			close(app.shutdownComplete)
 			app.setObserver(nil)
+			secureAgent.DeactivateSecurity()
 			return
 		case resp := <-app.collectorErrorChan:
 			run = nil
@@ -270,10 +295,11 @@ func (app *app) process() {
 			app.setState(nil, nil)
 
 			if resp.IsDisconnect() {
-				app.setState(nil, resp.Err)
+				app.setState(nil, resp.GetError())
 				app.Error("application disconnected", map[string]interface{}{
 					"app": app.config.AppName,
 				})
+				secureAgent.DeactivateSecurity()
 			} else if resp.IsRestartException() {
 				app.Info("application restarted", map[string]interface{}{
 					"app": app.config.AppName,
@@ -291,6 +317,13 @@ func (app *app) process() {
 					"server-SpanEvents.Enabled":        run.Config.SpanEvents.Enabled,
 				})
 			}
+
+			run.harvestConfig.CommonAttributes = commonAttributes{
+				hostname:   app.config.hostname,
+				entityName: app.config.AppName,
+				entityGUID: run.Reply.EntityGUID,
+			}
+
 			h = newHarvest(time.Now(), run.harvestConfig)
 			app.setState(run, nil)
 
@@ -299,6 +332,10 @@ func (app *app) process() {
 				"run": run.Reply.RunID.String(),
 			})
 			processConnectMessages(run, app)
+			secureAgent.RefreshState(getLinkedMetaData(app))
+			if run.Config.Profiling.Enabled {
+				app.StartProfiler()
+			}
 		}
 	}
 }
@@ -412,6 +449,11 @@ func newApp(c config) *app {
 				Timeout:   collectorTimeout,
 			},
 			Logger: c.Logger,
+			GzipWriterPool: &sync.Pool{
+				New: func() interface{} {
+					return gzip.NewWriter(io.Discard)
+				},
+			},
 		},
 	}
 
@@ -433,6 +475,10 @@ func newApp(c config) *app {
 			if app.config.RuntimeSampler.Enabled {
 				go runSampler(app, runtimeSamplerPeriod)
 			}
+		}
+		// for now run in its own goroutine but we may move this up to the main process later
+		if app.config.Profiling.Enabled {
+			app.StartProfiler()
 		}
 	}
 
@@ -462,7 +508,7 @@ func (app *app) getState() (*appRun, error) {
 	defer app.RUnlock()
 
 	run := app.run
-	if nil == run {
+	if run == nil {
 		run = app.placeholderRun
 	}
 	return run, app.err
@@ -496,25 +542,36 @@ func newTransaction(thd *thread) *Transaction {
 }
 
 // StartTransaction implements newrelic.Application's StartTransaction.
-func (app *app) StartTransaction(name string) *Transaction {
-	if nil == app {
+func (app *app) StartTransaction(name string, opts ...TraceOption) *Transaction {
+	if app == nil {
 		return nil
 	}
 	run, _ := app.getState()
-	return newTransaction(newTxn(app, run, name))
+	newtxn := newTransaction(newTxn(app, run, name, opts...))
+
+	//EXP:CPUSPAN
+	//if newtxn != nil && newtxn.thread != nil && newtxn.thread.Config.DistributedTracer.Enabled && newtxn.thread.Config.Profiling.Enabled && (newtxn.thread.Config.Profiling.SelectedProfiles&ProfilingTypeCPU) != 0 {
+	//	app.profilerStartSpan(newtxn)
+	//}
+	return newtxn
 }
 
 var (
 	errHighSecurityEnabled        = errors.New("high security enabled")
 	errCustomEventsDisabled       = errors.New("custom events disabled")
 	errCustomEventsRemoteDisabled = errors.New("custom events disabled by server")
+	errApplicationShutDown        = errors.New("application shut down")
 )
 
 // RecordCustomEvent implements newrelic.Application's RecordCustomEvent.
 func (app *app) RecordCustomEvent(eventType string, params map[string]interface{}) error {
+	var event *customEvent
+	var e error
+
 	if nil == app {
 		return nil
 	}
+
 	if app.config.Config.HighSecurity {
 		return errHighSecurityEnabled
 	}
@@ -523,7 +580,11 @@ func (app *app) RecordCustomEvent(eventType string, params map[string]interface{
 		return errCustomEventsDisabled
 	}
 
-	event, e := createCustomEvent(eventType, params, time.Now())
+	if eventType == "LlmEmbedding" || eventType == "LlmChatCompletionSummary" || eventType == "LlmChatCompletionMessage" {
+		event, e = createCustomEventUnlimitedSize(eventType, params, time.Now())
+	} else {
+		event, e = createCustomEvent(eventType, params, time.Now())
+	}
 	if nil != e {
 		return e
 	}
@@ -563,7 +624,7 @@ func (app *app) RecordCustomMetric(name string, value float64) error {
 	if math.IsInf(value, 0) {
 		return errMetricInf
 	}
-	if "" == name {
+	if name == "" {
 		return errMetricNameEmpty
 	}
 	run, _ := app.getState()
@@ -571,6 +632,26 @@ func (app *app) RecordCustomMetric(name string, value float64) error {
 		RawInputName: name,
 		Value:        value,
 	})
+	return nil
+}
+
+var (
+	errAppLoggingDisabled = errors.New("log data can not be recorded when application logging is disabled")
+)
+
+// RecordLog implements newrelic.Application's RecordLog.
+func (app *app) RecordLog(log *LogData) error {
+	if !app.config.ApplicationLogging.Enabled {
+		return errAppLoggingDisabled
+	}
+
+	event, err := log.toLogEvent()
+	if err != nil {
+		return err
+	}
+
+	run, _ := app.getState()
+	app.Consume(run.Reply.RunID, &event)
 	return nil
 }
 
@@ -591,7 +672,7 @@ func (app *app) Consume(id internal.AgentRunID, data harvestable) {
 		return
 	}
 
-	if "" == id {
+	if id == "" {
 		return
 	}
 
@@ -603,6 +684,18 @@ func (app *app) Consume(id internal.AgentRunID, data harvestable) {
 
 func (app *app) ExpectCustomEvents(t internal.Validator, want []internal.WantEvent) {
 	expectCustomEvents(extendValidator(t, "custom events"), app.testHarvest.CustomEvents, want)
+}
+
+// ExpectLogEvents from app checks that the contents of the logs test harvest matches the list of WantLogs.
+func (app *app) ExpectLogEvents(t internal.Validator, want []internal.WantLog) {
+	expectLogEvents(extendValidator(t, "log events"), app.testHarvest.LogEvents, want)
+}
+
+// ExpectLogEvents from transactions dumps all the log events from a transaction into the test harvest
+// then checks that the contents of the logs harvest matches the list of WantLogs.
+func (txn *Transaction) ExpectLogEvents(t internal.Validator, want []internal.WantLog) {
+	txn.thread.MergeIntoHarvest(txn.Application().app.testHarvest)
+	expectLogEvents(extendValidator(t, "log events"), txn.Application().app.testHarvest.LogEvents, want)
 }
 
 func (app *app) ExpectErrors(t internal.Validator, want []internal.WantError) {

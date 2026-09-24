@@ -5,8 +5,6 @@
 package nrawssdk
 
 import (
-	"net/http"
-
 	"github.com/aws/aws-sdk-go/aws/request"
 	"github.com/newrelic/go-agent/v3/internal"
 	"github.com/newrelic/go-agent/v3/internal/awssupport"
@@ -26,14 +24,7 @@ func startSegment(req *request.Request) {
 }
 
 func endSegment(req *request.Request) {
-	ctx := req.HTTPRequest.Context()
-
-	hdr := http.Header{}
-	if req.HTTPRequest != nil {
-		hdr = req.HTTPRequest.Header
-	}
-
-	awssupport.EndSegment(ctx, hdr)
+	awssupport.EndSegment(req.HTTPRequest.Context(), req.HTTPResponse)
 }
 
 // InstrumentHandlers will add instrumentation to the given *request.Handlers.
@@ -51,38 +42,38 @@ func endSegment(req *request.Request) {
 // invocation that uses the Session, call InstrumentHandlers with the session's
 // Handlers and add the current Transaction to the `http.Request`'s Context:
 //
-//    ses := session.New()
-//    // Add instrumentation to handlers
-//    nrawssdk.InstrumentHandlers(&ses.Handlers)
-//    lambdaClient   = lambda.New(ses, aws.NewConfig())
+//	ses := session.New()
+//	// Add instrumentation to handlers
+//	nrawssdk.InstrumentHandlers(&ses.Handlers)
+//	lambdaClient   = lambda.New(ses, aws.NewConfig())
 //
-//    req, out := lambdaClient.InvokeRequest(&lambda.InvokeInput{
-//        ClientContext:  aws.String("MyApp"),
-//        FunctionName:   aws.String("Function"),
-//        InvocationType: aws.String("Event"),
-//        LogType:        aws.String("Tail"),
-//        Payload:        []byte("{}"),
-//    }
-//    // Add txn to http.Request's context
-//    req.HTTPRequest = newrelic.RequestWithTransactionContext(req.HTTPRequest, txn)
-//    err := req.Send()
+//	req, out := lambdaClient.InvokeRequest(&lambda.InvokeInput{
+//	    ClientContext:  aws.String("MyApp"),
+//	    FunctionName:   aws.String("Function"),
+//	    InvocationType: aws.String("Event"),
+//	    LogType:        aws.String("Tail"),
+//	    Payload:        []byte("{}"),
+//	}
+//	// Add txn to http.Request's context
+//	req.HTTPRequest = newrelic.RequestWithTransactionContext(req.HTTPRequest, txn)
+//	err := req.Send()
 //
 // To add instrumentation to a Request and see a segment created just for the
 // individual request, call InstrumentHandlers with the `request.Request`'s
 // Handlers and add the current Transaction to the `http.Request`'s Context:
 //
-//    req, out := lambdaClient.InvokeRequest(&lambda.InvokeInput{
-//        ClientContext:  aws.String("MyApp"),
-//        FunctionName:   aws.String("Function"),
-//        InvocationType: aws.String("Event"),
-//        LogType:        aws.String("Tail"),
-//        Payload:        []byte("{}"),
-//    }
-//    // Add instrumentation to handlers
-//    nrawssdk.InstrumentHandlers(&req.Handlers)
-//    // Add txn to http.Request's context
-//    req.HTTPRequest = newrelic.RequestWithTransactionContext(req.HTTPRequest, txn)
-//    err := req.Send()
+//	req, out := lambdaClient.InvokeRequest(&lambda.InvokeInput{
+//	    ClientContext:  aws.String("MyApp"),
+//	    FunctionName:   aws.String("Function"),
+//	    InvocationType: aws.String("Event"),
+//	    LogType:        aws.String("Tail"),
+//	    Payload:        []byte("{}"),
+//	}
+//	// Add instrumentation to handlers
+//	nrawssdk.InstrumentHandlers(&req.Handlers)
+//	// Add txn to http.Request's context
+//	req.HTTPRequest = newrelic.RequestWithTransactionContext(req.HTTPRequest, txn)
+//	err := req.Send()
 func InstrumentHandlers(handlers *request.Handlers) {
 	handlers.Send.SetFrontNamed(request.NamedHandler{
 		Name: "StartNewRelicSegment",

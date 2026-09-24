@@ -14,7 +14,7 @@ import (
 func TestSetWebResponseNil(t *testing.T) {
 	// Test that the methods of the txn.SetWebResponse(nil) return value
 	// writer can safely be called.
-	app := testApp(nil, nil, t)
+	app := testApp(nil, ConfigDistributedTracerEnabled(false), t)
 	txn := app.StartTransaction("hello")
 	rw := txn.SetWebResponse(nil)
 	rw.WriteHeader(123)
@@ -38,11 +38,11 @@ func TestSetWebResponseNil(t *testing.T) {
 func TestSetWebResponseSuccess(t *testing.T) {
 	// Test that the return value of txn.SetWebResponse delegates to the
 	// input writer.
-	app := testApp(nil, nil, t)
+	app := testApp(nil, ConfigDistributedTracerEnabled(false), t)
 	txn := app.StartTransaction("hello")
 	w := httptest.NewRecorder()
 	rw := txn.SetWebResponse(w)
-	rw.WriteHeader(123)
+	rw.WriteHeader(200)
 	hdr := rw.Header()
 	hdr.Set("zip", "zap")
 	body := "should not panic"
@@ -51,7 +51,7 @@ func TestSetWebResponseSuccess(t *testing.T) {
 		t.Error(err, n)
 	}
 	txn.End()
-	if w.Code != 123 {
+	if w.Code != 200 {
 		t.Error(w.Code)
 	}
 	if w.HeaderMap.Get("zip") != "zap" {
@@ -62,8 +62,8 @@ func TestSetWebResponseSuccess(t *testing.T) {
 	}
 	app.ExpectTxnEvents(t, []internal.WantEvent{{
 		AgentAttributes: map[string]interface{}{
-			"httpResponseCode": 123,
-			"http.statusCode":  123,
+			"httpResponseCode": 200,
+			"http.statusCode":  200,
 		},
 		Intrinsics: map[string]interface{}{"name": "OtherTransaction/Go/hello"},
 	}})
@@ -79,7 +79,7 @@ func (w writerWithFlush) Flush()                    {}
 func TestSetWebResponseTxnUpgraded(t *testing.T) {
 	// Test that the writer returned by SetWebResponse has the optional
 	// methods of the input writer.
-	app := testApp(nil, nil, t)
+	app := testApp(nil, ConfigDistributedTracerEnabled(false), t)
 	txn := app.StartTransaction("hello")
 	rw := txn.SetWebResponse(writerWithFlush{})
 	if _, ok := rw.(http.Flusher); !ok {

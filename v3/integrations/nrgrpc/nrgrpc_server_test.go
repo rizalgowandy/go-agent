@@ -5,12 +5,15 @@ package nrgrpc
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"strings"
 	"testing"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/test/bufconn"
 
 	"github.com/newrelic/go-agent/v3/integrations/nrgrpc/testapp"
@@ -39,7 +42,7 @@ func newTestServerAndConn(t *testing.T, app *newrelic.Application) (*grpc.Server
 	}
 	conn, err := grpc.Dial("bufnet",
 		grpc.WithContextDialer(bufDialer),
-		grpc.WithInsecure(),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithBlock(), // create the connection synchronously
 		grpc.WithUnaryInterceptor(UnaryClientInterceptor),
 		grpc.WithStreamInterceptor(StreamClientInterceptor),
@@ -51,6 +54,207 @@ func newTestServerAndConn(t *testing.T, app *newrelic.Application) (*grpc.Server
 	return s, conn
 }
 
+func TestWithCustomStatusHandler(t *testing.T) {
+	app := testApp()
+	Configure(WithStatusHandler(codes.OK, WarningInterceptorStatusHandler))
+
+	s, conn := newTestServerAndConn(t, app.Application)
+	defer s.Stop()
+	defer conn.Close()
+
+	client := testapp.NewTestApplicationClient(conn)
+	txn := app.StartTransaction("client")
+	ctx := newrelic.NewContext(context.Background(), txn)
+	_, err := client.DoUnaryUnary(ctx, &testapp.Message{})
+	if err != nil {
+		t.Fatal("unable to call client DoUnaryUnary", err)
+	}
+
+	app.ExpectMetrics(t, []internal.WantMetric{
+		{Name: "Apdex", Scope: "", Forced: true, Data: nil},
+		{Name: "Apdex/Go/TestApplication/DoUnaryUnary", Scope: "", Forced: false, Data: nil},
+		{Name: "Custom/DoUnaryUnary", Scope: "", Forced: false, Data: nil},
+		{Name: "Custom/DoUnaryUnary", Scope: "WebTransaction/Go/TestApplication/DoUnaryUnary", Forced: false, Data: nil},
+		{Name: "DurationByCaller/App/123/456/HTTP/all", Scope: "", Forced: false, Data: nil},
+		{Name: "DurationByCaller/App/123/456/HTTP/allWeb", Scope: "", Forced: false, Data: nil},
+		{Name: "HttpDispatcher", Scope: "", Forced: true, Data: nil},
+		{Name: "Supportability/TraceContext/Accept/Success", Scope: "", Forced: true, Data: nil},
+		{Name: "TransportDuration/App/123/456/HTTP/all", Scope: "", Forced: false, Data: nil},
+		{Name: "TransportDuration/App/123/456/HTTP/allWeb", Scope: "", Forced: false, Data: nil},
+		{Name: "WebTransaction", Scope: "", Forced: true, Data: nil},
+		{Name: "WebTransaction/Go/TestApplication/DoUnaryUnary", Scope: "", Forced: true, Data: nil},
+		{Name: "WebTransactionTotalTime", Scope: "", Forced: true, Data: nil},
+		{Name: "WebTransactionTotalTime/Go/TestApplication/DoUnaryUnary", Scope: "", Forced: false, Data: nil},
+	})
+	app.ExpectTxnEvents(t, []internal.WantEvent{{
+		Intrinsics: map[string]interface{}{
+			"guid":                     internal.MatchAnything,
+			"name":                     "WebTransaction/Go/TestApplication/DoUnaryUnary",
+			"nr.apdexPerfZone":         internal.MatchAnything,
+			"parent.account":           123,
+			"parent.app":               456,
+			"parent.transportDuration": internal.MatchAnything,
+			"parent.transportType":     "HTTP",
+			"parent.type":              "App",
+			"parentId":                 internal.MatchAnything,
+			"parentSpanId":             internal.MatchAnything,
+			"priority":                 internal.MatchAnything,
+			"sampled":                  internal.MatchAnything,
+			"traceId":                  internal.MatchAnything,
+		},
+		UserAttributes: map[string]interface{}{
+			"grpcStatusLevel":   "warning",
+			"grpcStatusCode":    "OK",
+			"grpcStatusMessage": internal.MatchAnything,
+		},
+		AgentAttributes: map[string]interface{}{
+			"httpResponseCode":            0,
+			"http.statusCode":             0,
+			"request.headers.contentType": "application/grpc",
+			"request.method":              "TestApplication/DoUnaryUnary",
+			"request.uri":                 "grpc://bufnet/TestApplication/DoUnaryUnary",
+		},
+	}})
+	app.ExpectSpanEvents(t, []internal.WantEvent{
+		{
+			Intrinsics: map[string]interface{}{
+				"category": "generic",
+				"name":     "Custom/DoUnaryUnary",
+				"parentId": internal.MatchAnything,
+			},
+			UserAttributes:  map[string]interface{}{},
+			AgentAttributes: map[string]interface{}{},
+		},
+		{
+			Intrinsics: map[string]interface{}{
+				"category":         "generic",
+				"name":             "WebTransaction/Go/TestApplication/DoUnaryUnary",
+				"transaction.name": "WebTransaction/Go/TestApplication/DoUnaryUnary",
+				"nr.entryPoint":    true,
+				"parentId":         internal.MatchAnything,
+				"trustedParentId":  internal.MatchAnything,
+			},
+			UserAttributes: map[string]interface{}{
+				"grpcStatusLevel": "warning",
+				"grpcStatusCode":  "OK",
+			},
+			AgentAttributes: map[string]interface{}{
+				"httpResponseCode":            0,
+				"http.statusCode":             0,
+				"parent.account":              "123",
+				"parent.app":                  "456",
+				"parent.transportDuration":    internal.MatchAnything,
+				"parent.transportType":        "HTTP",
+				"parent.type":                 "App",
+				"request.headers.contentType": "application/grpc",
+				"request.method":              "TestApplication/DoUnaryUnary",
+				"request.uri":                 "grpc://bufnet/TestApplication/DoUnaryUnary",
+			},
+		},
+	})
+	Configure(WithStatusHandler(codes.OK, OKInterceptorStatusHandler))
+}
+
+func TestWithInfoStatusHandler(t *testing.T) {
+	app := testApp()
+	Configure(WithStatusHandler(codes.OK, InfoInterceptorStatusHandler))
+
+	s, conn := newTestServerAndConn(t, app.Application)
+	defer s.Stop()
+	defer conn.Close()
+
+	client := testapp.NewTestApplicationClient(conn)
+	txn := app.StartTransaction("client")
+	ctx := newrelic.NewContext(context.Background(), txn)
+	_, err := client.DoUnaryUnary(ctx, &testapp.Message{})
+	if err != nil {
+		t.Fatal("unable to call client DoUnaryUnary", err)
+	}
+
+	app.ExpectMetrics(t, []internal.WantMetric{
+		{Name: "Apdex", Scope: "", Forced: true, Data: nil},
+		{Name: "Apdex/Go/TestApplication/DoUnaryUnary", Scope: "", Forced: false, Data: nil},
+		{Name: "Custom/DoUnaryUnary", Scope: "", Forced: false, Data: nil},
+		{Name: "Custom/DoUnaryUnary", Scope: "WebTransaction/Go/TestApplication/DoUnaryUnary", Forced: false, Data: nil},
+		{Name: "DurationByCaller/App/123/456/HTTP/all", Scope: "", Forced: false, Data: nil},
+		{Name: "DurationByCaller/App/123/456/HTTP/allWeb", Scope: "", Forced: false, Data: nil},
+		{Name: "HttpDispatcher", Scope: "", Forced: true, Data: nil},
+		{Name: "Supportability/TraceContext/Accept/Success", Scope: "", Forced: true, Data: nil},
+		{Name: "TransportDuration/App/123/456/HTTP/all", Scope: "", Forced: false, Data: nil},
+		{Name: "TransportDuration/App/123/456/HTTP/allWeb", Scope: "", Forced: false, Data: nil},
+		{Name: "WebTransaction", Scope: "", Forced: true, Data: nil},
+		{Name: "WebTransaction/Go/TestApplication/DoUnaryUnary", Scope: "", Forced: true, Data: nil},
+		{Name: "WebTransactionTotalTime", Scope: "", Forced: true, Data: nil},
+		{Name: "WebTransactionTotalTime/Go/TestApplication/DoUnaryUnary", Scope: "", Forced: false, Data: nil},
+	})
+	app.ExpectTxnEvents(t, []internal.WantEvent{{
+		Intrinsics: map[string]interface{}{
+			"guid":                     internal.MatchAnything,
+			"name":                     "WebTransaction/Go/TestApplication/DoUnaryUnary",
+			"nr.apdexPerfZone":         internal.MatchAnything,
+			"parent.account":           123,
+			"parent.app":               456,
+			"parent.transportDuration": internal.MatchAnything,
+			"parent.transportType":     "HTTP",
+			"parent.type":              "App",
+			"parentId":                 internal.MatchAnything,
+			"parentSpanId":             internal.MatchAnything,
+			"priority":                 internal.MatchAnything,
+			"sampled":                  internal.MatchAnything,
+			"traceId":                  internal.MatchAnything,
+		},
+		UserAttributes: map[string]interface{}{
+			"grpcStatusLevel":   "info",
+			"grpcStatusCode":    "OK",
+			"grpcStatusMessage": internal.MatchAnything,
+		},
+		AgentAttributes: map[string]interface{}{
+			"httpResponseCode":            0,
+			"http.statusCode":             0,
+			"request.headers.contentType": "application/grpc",
+			"request.method":              "TestApplication/DoUnaryUnary",
+			"request.uri":                 "grpc://bufnet/TestApplication/DoUnaryUnary",
+		},
+	}})
+	app.ExpectSpanEvents(t, []internal.WantEvent{
+		{
+			Intrinsics: map[string]interface{}{
+				"category": "generic",
+				"name":     "Custom/DoUnaryUnary",
+				"parentId": internal.MatchAnything,
+			},
+			UserAttributes:  map[string]interface{}{},
+			AgentAttributes: map[string]interface{}{},
+		},
+		{
+			Intrinsics: map[string]interface{}{
+				"category":         "generic",
+				"name":             "WebTransaction/Go/TestApplication/DoUnaryUnary",
+				"transaction.name": "WebTransaction/Go/TestApplication/DoUnaryUnary",
+				"nr.entryPoint":    true,
+				"parentId":         internal.MatchAnything,
+				"trustedParentId":  internal.MatchAnything,
+			},
+			UserAttributes: map[string]interface{}{
+				"grpcStatusLevel": "info",
+				"grpcStatusCode":  "OK",
+			},
+			AgentAttributes: map[string]interface{}{
+				"httpResponseCode":            0,
+				"http.statusCode":             0,
+				"parent.account":              "123",
+				"parent.app":                  "456",
+				"parent.transportDuration":    internal.MatchAnything,
+				"parent.transportType":        "HTTP",
+				"parent.type":                 "App",
+				"request.headers.contentType": "application/grpc",
+				"request.method":              "TestApplication/DoUnaryUnary",
+				"request.uri":                 "grpc://bufnet/TestApplication/DoUnaryUnary",
+			},
+		},
+	})
+	Configure(WithStatusHandler(codes.OK, OKInterceptorStatusHandler))
+}
 func TestUnaryServerInterceptor(t *testing.T) {
 	app := testApp()
 
@@ -141,6 +345,7 @@ func TestUnaryServerInterceptor(t *testing.T) {
 			},
 		},
 	})
+
 }
 
 func TestUnaryServerInterceptorError(t *testing.T) {
@@ -182,9 +387,9 @@ func TestUnaryServerInterceptorError(t *testing.T) {
 			"traceId":          internal.MatchAnything,
 		},
 		UserAttributes: map[string]interface{}{
-			"GrpcStatusMessage": "oooooops!",
-			"GrpcStatusCode":    "DataLoss",
-			"GrpcStatusLevel":   "error",
+			"grpcStatusMessage": "oooooops!",
+			"grpcStatusCode":    "DataLoss",
+			"grpcStatusLevel":   "error",
 		},
 		AgentAttributes: map[string]interface{}{
 			"httpResponseCode":            0,
@@ -215,9 +420,9 @@ func TestUnaryServerInterceptorError(t *testing.T) {
 			"request.uri":                 "grpc://bufnet/TestApplication/DoUnaryUnaryError",
 		},
 		UserAttributes: map[string]interface{}{
-			"GrpcStatusMessage": "oooooops!",
-			"GrpcStatusCode":    "DataLoss",
-			"GrpcStatusLevel":   "error",
+			"grpcStatusMessage": "oooooops!",
+			"grpcStatusCode":    "DataLoss",
+			"grpcStatusLevel":   "error",
 		},
 	}})
 }
@@ -446,9 +651,9 @@ func TestStreamStreamServerInterceptor(t *testing.T) {
 	if err != nil {
 		t.Fatal("client call to DoStreamStream failed", err)
 	}
-	waitc := make(chan struct{})
-	go func() {
-		defer close(waitc)
+
+	errc := make(chan error)
+	go func(errc chan error) {
 		var recved int
 		for {
 			_, err := stream.Recv()
@@ -456,21 +661,29 @@ func TestStreamStreamServerInterceptor(t *testing.T) {
 				break
 			}
 			if err != nil {
-				t.Fatal("failure to Recv", err)
+				errc <- fmt.Errorf("failure to Recv: %v", err)
+				return
 			}
 			recved++
 		}
 		if recved != 3 {
-			t.Fatal("received incorrect number of messages from server", recved)
+			errc <- fmt.Errorf("received incorrect number of messages from server: %v", recved)
+			return
 		}
-	}()
+		errc <- nil
+	}(errc)
 	for i := 0; i < 3; i++ {
 		if err := stream.Send(&testapp.Message{Text: "Hello DoStreamStream"}); err != nil {
 			t.Fatal("failure to Send", err)
 		}
 	}
 	stream.CloseSend()
-	<-waitc
+
+	err = <-errc
+	close(errc)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	app.ExpectMetrics(t, []internal.WantMetric{
 		{Name: "Apdex", Scope: "", Forced: true, Data: nil},
@@ -592,9 +805,9 @@ func TestStreamServerInterceptorError(t *testing.T) {
 			"traceId":          internal.MatchAnything,
 		},
 		UserAttributes: map[string]interface{}{
-			"GrpcStatusLevel":   "error",
-			"GrpcStatusMessage": "oooooops!",
-			"GrpcStatusCode":    "DataLoss",
+			"grpcStatusLevel":   "error",
+			"grpcStatusMessage": "oooooops!",
+			"grpcStatusCode":    "DataLoss",
 		},
 		AgentAttributes: map[string]interface{}{
 			"httpResponseCode":            0,
@@ -625,9 +838,9 @@ func TestStreamServerInterceptorError(t *testing.T) {
 			"request.uri":                 "grpc://bufnet/TestApplication/DoUnaryStreamError",
 		},
 		UserAttributes: map[string]interface{}{
-			"GrpcStatusLevel":   "error",
-			"GrpcStatusMessage": "oooooops!",
-			"GrpcStatusCode":    "DataLoss",
+			"grpcStatusLevel":   "error",
+			"grpcStatusMessage": "oooooops!",
+			"grpcStatusCode":    "DataLoss",
 		},
 	}})
 }

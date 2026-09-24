@@ -6,13 +6,15 @@ package nrgrpc
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"testing"
 
 	"github.com/newrelic/go-agent/v3/integrations/nrgrpc/testapp"
+	"github.com/newrelic/go-agent/v3/integrations/nrsecurityagent"
 	"github.com/newrelic/go-agent/v3/internal"
-	"github.com/newrelic/go-agent/v3/internal/integrationsupport"
 	newrelic "github.com/newrelic/go-agent/v3/newrelic"
+	"github.com/newrelic/go-agent/v3/newrelic/integrationsupport"
 	"google.golang.org/grpc/metadata"
 )
 
@@ -74,7 +76,7 @@ func TestGetURL(t *testing.T) {
 }
 
 func testApp() integrationsupport.ExpectApp {
-	return integrationsupport.NewTestApp(replyFn, integrationsupport.ConfigFullTraces)
+	return integrationsupport.NewTestApp(replyFn, integrationsupport.ConfigFullTraces, newrelic.ConfigCodeLevelMetricsEnabled(false))
 }
 
 var replyFn = func(reply *internal.ConnectReply) {
@@ -152,7 +154,7 @@ func TestUnaryClientInterceptor(t *testing.T) {
 			Attributes:  map[string]interface{}{},
 			Children: []internal.WantTraceSegment{{
 				SegmentName: "OtherTransaction/Go/UnaryUnary",
-				Attributes:  map[string]interface{}{"exclusive_duration_millis": internal.MatchAnything},
+				Attributes:  map[string]interface{}{},
 				Children: []internal.WantTraceSegment{
 					{
 						SegmentName: "External/bufnet/gRPC/TestApplication/DoUnaryUnary",
@@ -246,7 +248,7 @@ func TestUnaryStreamClientInterceptor(t *testing.T) {
 			Attributes:  map[string]interface{}{},
 			Children: []internal.WantTraceSegment{{
 				SegmentName: "OtherTransaction/Go/UnaryStream",
-				Attributes:  map[string]interface{}{"exclusive_duration_millis": internal.MatchAnything},
+				Attributes:  map[string]interface{}{},
 				Children: []internal.WantTraceSegment{
 					{
 						SegmentName: "External/bufnet/gRPC/TestApplication/DoUnaryStream",
@@ -338,7 +340,7 @@ func TestStreamUnaryClientInterceptor(t *testing.T) {
 			Attributes:  map[string]interface{}{},
 			Children: []internal.WantTraceSegment{{
 				SegmentName: "OtherTransaction/Go/StreamUnary",
-				Attributes:  map[string]interface{}{"exclusive_duration_millis": internal.MatchAnything},
+				Attributes:  map[string]interface{}{},
 				Children: []internal.WantTraceSegment{
 					{
 						SegmentName: "External/bufnet/gRPC/TestApplication/DoStreamUnary",
@@ -364,9 +366,9 @@ func TestStreamStreamClientInterceptor(t *testing.T) {
 	if err != nil {
 		t.Fatal("client call to DoStreamStream failed", err)
 	}
-	waitc := make(chan struct{})
-	go func() {
-		defer close(waitc)
+
+	errC := make(chan error)
+	go func(errC chan error) {
 		var recved int
 		for {
 			msg, err := stream.Recv()
@@ -374,29 +376,40 @@ func TestStreamStreamClientInterceptor(t *testing.T) {
 				break
 			}
 			if err != nil {
-				t.Fatal("failure to Recv", err)
+				errC <- fmt.Errorf("failure to Recv: %v", err)
+				return
 			}
 			var hdrs map[string][]string
 			err = json.Unmarshal([]byte(msg.Text), &hdrs)
 			if err != nil {
-				t.Fatal("cannot unmarshall client response", err)
+				errC <- fmt.Errorf("cannot unmarshall client response: %v", err)
+				return
 			}
 			if hdr, ok := hdrs["newrelic"]; !ok || len(hdr) != 1 || hdr[0] == "" {
-				t.Error("distributed trace header not sent", hdrs)
+				errC <- fmt.Errorf("distributed trace header not sent: %v", hdrs)
+				return
 			}
 			recved++
 		}
 		if recved != 3 {
-			t.Fatal("received incorrect number of messages from server", recved)
+			errC <- fmt.Errorf("received incorrect number of messages from server: %v", recved)
+			return
 		}
-	}()
+		errC <- nil
+	}(errC)
 	for i := 0; i < 3; i++ {
 		if err := stream.Send(&testapp.Message{Text: "Hello DoStreamStream"}); err != nil {
 			t.Fatal("failure to Send", err)
 		}
 	}
 	stream.CloseSend()
-	<-waitc
+
+	err = <-errC
+	close(errC)
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	txn.End()
 
 	app.ExpectMetrics(t, []internal.WantMetric{
@@ -443,7 +456,7 @@ func TestStreamStreamClientInterceptor(t *testing.T) {
 			Attributes:  map[string]interface{}{},
 			Children: []internal.WantTraceSegment{{
 				SegmentName: "OtherTransaction/Go/StreamStream",
-				Attributes:  map[string]interface{}{"exclusive_duration_millis": internal.MatchAnything},
+				Attributes:  map[string]interface{}{},
 				Children: []internal.WantTraceSegment{
 					{
 						SegmentName: "External/bufnet/gRPC/TestApplication/DoStreamStream",
@@ -591,9 +604,21 @@ func TestClientStreamingError(t *testing.T) {
 			Attributes:  map[string]interface{}{},
 			Children: []internal.WantTraceSegment{{
 				SegmentName: "OtherTransaction/Go/UnaryStream",
-				Attributes:  map[string]interface{}{"exclusive_duration_millis": internal.MatchAnything},
+				Attributes:  map[string]interface{}{},
 				Children:    []internal.WantTraceSegment{},
 			}},
 		},
 	}})
+}
+
+func TestClientSecurityAgentEnabled(t *testing.T) {
+	app := testApp()
+	err := nrsecurityagent.InitSecurityAgent(app.Application,
+		nrsecurityagent.ConfigSecurityMode("IAST"),
+		nrsecurityagent.ConfigSecurityValidatorServiceEndPointUrl("wss://csec.nr-data.net"),
+		nrsecurityagent.ConfigSecurityEnable(true),
+	)
+	if err != nil {
+		t.Fatal("Could not setup the nrsecurityagent", err)
+	}
 }

@@ -13,9 +13,9 @@ import (
 	"time"
 
 	"github.com/newrelic/go-agent/v3/internal"
-	"github.com/newrelic/go-agent/v3/internal/integrationsupport"
 	"github.com/newrelic/go-agent/v3/internal/sysinfo"
 	newrelic "github.com/newrelic/go-agent/v3/newrelic"
+	"github.com/newrelic/go-agent/v3/newrelic/integrationsupport"
 	"github.com/sirupsen/logrus"
 )
 
@@ -34,6 +34,7 @@ func newTestLogger(out io.Writer) *logrus.Logger {
 }
 
 func validateOutput(t *testing.T, out *bytes.Buffer, expected map[string]interface{}) {
+
 	var actual map[string]interface{}
 	if err := json.Unmarshal(out.Bytes(), &actual); nil != err {
 		t.Fatal("failed to unmarshal log output:", err)
@@ -151,6 +152,7 @@ func TestLogDistributedTracingDisabled(t *testing.T) {
 		"message":     "Hello World!",
 		"method.name": matchAnything,
 		"timestamp":   float64(1417136460000),
+		"trace.id":    matchAnything,
 	})
 }
 
@@ -282,10 +284,11 @@ func TestEntryError(t *testing.T) {
 		"line.number": matchAnything,
 		"log.level":   "info",
 		// Since the err field on the Entry is private we cannot record it.
-		//"logrus_error": `can not add field "func"`,
+		// "logrus_error": `can not add field "func"`,
 		"message":     "Hello World!",
 		"method.name": matchAnything,
 		"timestamp":   float64(1417136460000),
+		"trace.id":    matchAnything,
 	})
 }
 
@@ -307,6 +310,7 @@ func TestWithCustomField(t *testing.T) {
 		"method.name": matchAnything,
 		"timestamp":   float64(1417136460000),
 		"zip":         "zap",
+		"trace.id":    matchAnything,
 	})
 }
 

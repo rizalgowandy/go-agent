@@ -44,8 +44,18 @@ func (e *customEvent) WriteJSON(buf *bytes.Buffer) {
 	buf.WriteByte(',')
 	buf.WriteByte('{')
 	w = jsonFieldsWriter{buf: buf}
-	for key, val := range e.truncatedParams {
-		writeAttributeValueJSON(&w, key, val)
+	// LLM event types MUST preserve full-length attribute values so the
+	// collector can count tokens server-side. Every other custom event type
+	// keeps the default byte-limit truncation.
+	// https://source.datanerd.us/agents/agent-specs/blob/main/artificial_intelligence/LLMs.md#llm-events
+	if e.eventType == "LlmEmbedding" || e.eventType == "LlmChatCompletionSummary" || e.eventType == "LlmChatCompletionMessage" {
+		for key, val := range e.truncatedParams {
+			writeAttributeValueJSONLimit(&w, key, val, 0)
+		}
+	} else {
+		for key, val := range e.truncatedParams {
+			writeAttributeValueJSON(&w, key, val)
+		}
 	}
 	buf.WriteByte('}')
 
@@ -88,6 +98,32 @@ func createCustomEvent(eventType string, params map[string]interface{}, now time
 	for key, val := range params {
 		val, err := validateUserAttribute(key, val)
 		if nil != err {
+			return nil, err
+		}
+		truncatedParams[key] = val
+	}
+
+	return &customEvent{
+		eventType:       eventType,
+		timestamp:       now,
+		truncatedParams: truncatedParams,
+	}, nil
+}
+
+// CreateCustomEventUnlimitedSize creates a custom event without restricting string value length.
+func createCustomEventUnlimitedSize(eventType string, params map[string]interface{}, now time.Time) (*customEvent, error) {
+	if err := eventTypeValidate(eventType); err != nil {
+		return nil, err
+	}
+
+	if len(params) > customEventAttributeLimit {
+		return nil, errNumAttributes
+	}
+
+	truncatedParams := make(map[string]interface{})
+	for key, val := range params {
+		val, err := validateUserAttributeUnlimitedSize(key, val)
+		if err != nil {
 			return nil, err
 		}
 		truncatedParams[key] = val

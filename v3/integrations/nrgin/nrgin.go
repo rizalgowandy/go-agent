@@ -19,7 +19,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/newrelic/go-agent/v3/internal"
-	newrelic "github.com/newrelic/go-agent/v3/newrelic"
+	"github.com/newrelic/go-agent/v3/newrelic"
 )
 
 func init() { internal.TrackUsage("integration", "framework", "gin", "v1") }
@@ -60,11 +60,17 @@ func (w *replacementResponseWriter) WriteHeader(code int) {
 
 func (w *replacementResponseWriter) Write(data []byte) (int, error) {
 	w.flushHeader()
+	if newrelic.IsSecurityAgentPresent() {
+		w.replacement.Write(data)
+	}
 	return w.ResponseWriter.Write(data)
 }
 
 func (w *replacementResponseWriter) WriteString(s string) (int, error) {
 	w.flushHeader()
+	if newrelic.IsSecurityAgentPresent() {
+		w.replacement.Write([]byte(s))
+	}
 	return w.ResponseWriter.WriteString(s)
 }
 
@@ -107,7 +113,22 @@ func getName(c handlerNamer, useNewNames bool) string {
 	return c.HandlerName()
 }
 
-// Middleware creates a Gin middleware that instruments requests.
+// MiddlewareOption defines a functional option for configuring the Middleware.
+type MiddlewareOption func(*middlewareConfig)
+
+type middlewareConfig struct {
+	filterFunc func(*gin.Context) bool
+}
+
+// WithFilter allows users to provide a custom filter function to determine
+// whether a request should be monitored.
+func WithFilter(filter func(*gin.Context) bool) MiddlewareOption {
+	return func(cfg *middlewareConfig) {
+		cfg.filterFunc = filter
+	}
+}
+
+// Middleware creates a Gin middleware that instruments requests with optional configurations.
 //
 //	router := gin.Default()
 //	// Add the nrgin middleware before other middlewares or routes:
@@ -119,8 +140,8 @@ func getName(c handlerNamer, useNewNames bool) string {
 // gin.Context.HandlerName if not.  If you are using Gin v1.5.0 and wish to
 // continue using the old transaction names, use
 // nrgin.MiddlewareHandlerTxnNames.
-func Middleware(app *newrelic.Application) gin.HandlerFunc {
-	return middleware(app, true)
+func Middleware(app *newrelic.Application, opts ...MiddlewareOption) gin.HandlerFunc {
+	return middleware(app, true, opts...)
 }
 
 // MiddlewareHandlerTxnNames creates a Gin middleware that instruments
@@ -138,13 +159,47 @@ func MiddlewareHandlerTxnNames(app *newrelic.Application) gin.HandlerFunc {
 	return middleware(app, false)
 }
 
-func middleware(app *newrelic.Application, useNewNames bool) gin.HandlerFunc {
+// WrapRouter extracts API endpoints from the router instance passed to it
+// which is used to detect application URL mapping(api-endpoints) for provable security.
+// In this version of the integration, this wrapper is only necessary if you are using the New Relic security agent integration [https://github.com/newrelic/go-agent/tree/master/v3/integrations/nrsecurityagent],
+// but it may be enhanced to provide additional functionality in future releases.
+//
+//	router := gin.Default()
+//	....
+//	....
+//	....
+//
+//	nrgin.WrapRouter(router)
+func WrapRouter(engine *gin.Engine) {
+	if engine != nil && newrelic.IsSecurityAgentPresent() {
+		router := engine.Routes()
+		for _, r := range router {
+			newrelic.GetSecurityAgentInterface().SendEvent("API_END_POINTS", r.Path, r.Method, internal.HandlerName(r.HandlerFunc))
+		}
+	}
+}
+
+func middleware(app *newrelic.Application, useNewNames bool, opts ...MiddlewareOption) gin.HandlerFunc {
+	config := &middlewareConfig{}
+	for _, opt := range opts {
+		opt(config)
+	}
+
 	return func(c *gin.Context) {
+		if config.filterFunc != nil && !config.filterFunc(c) {
+			c.Next()
+			return
+		}
+
+		traceID := ""
 		if app != nil {
 			name := c.Request.Method + " " + getName(c, useNewNames)
 
 			w := &headerResponseWriter{w: c.Writer}
-			txn := app.StartTransaction(name)
+			txn := app.StartTransaction(name, newrelic.WithFunctionLocation(c.Handler()))
+			if newrelic.IsSecurityAgentPresent() {
+				txn.SetCsecAttributes(newrelic.AttributeCsecRoute, c.FullPath())
+			}
 			txn.SetWebRequestHTTP(c.Request)
 			defer txn.End()
 
@@ -157,7 +212,11 @@ func middleware(app *newrelic.Application, useNewNames bool) gin.HandlerFunc {
 			defer repl.flushHeader()
 
 			c.Set(internal.GinTransactionContextKey, txn)
+			traceID = txn.GetLinkingMetadata().TraceID
 		}
 		c.Next()
+		if newrelic.IsSecurityAgentPresent() {
+			newrelic.GetSecurityAgentInterface().SendEvent("RESPONSE_HEADER", c.Writer.Header(), traceID)
+		}
 	}
 }

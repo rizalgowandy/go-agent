@@ -5,13 +5,16 @@ package newrelic
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"math"
 	"net/http"
 	"net/url"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 const (
@@ -19,6 +22,9 @@ const (
 	// listed as span attributes to simplify code. It is not listed in the
 	// public attributes.go file for this reason to prevent confusion.
 	spanAttributeQueryParameters = "query_parameters"
+
+	// The collector can only allow attributes to be a maximum of 256 bytes
+	maxAttributeLengthBytes = 256
 )
 
 var (
@@ -29,30 +35,46 @@ var (
 	// attributes.go and add its default destinations here.
 	//
 	agentAttributeDefaultDests = map[string]destinationSet{
-		AttributeHostDisplayName:            usualDests,
-		AttributeRequestMethod:              usualDests,
-		AttributeRequestAccept:              usualDests,
-		AttributeRequestContentType:         usualDests,
-		AttributeRequestContentLength:       usualDests,
-		AttributeRequestHost:                usualDests,
-		AttributeRequestUserAgent:           tracesDests,
-		AttributeRequestUserAgentDeprecated: tracesDests,
-		AttributeRequestReferer:             tracesDests,
-		AttributeRequestURI:                 usualDests,
-		AttributeResponseContentType:        usualDests,
-		AttributeResponseContentLength:      usualDests,
-		AttributeResponseCode:               usualDests,
-		AttributeResponseCodeDeprecated:     usualDests,
-		AttributeAWSRequestID:               usualDests,
-		AttributeAWSLambdaARN:               usualDests,
-		AttributeAWSLambdaColdStart:         usualDests,
-		AttributeAWSLambdaEventSourceARN:    usualDests,
-		AttributeMessageRoutingKey:          usualDests,
-		AttributeMessageQueueName:           usualDests,
-		AttributeMessageExchangeType:        destNone,
-		AttributeMessageReplyTo:             destNone,
-		AttributeMessageCorrelationID:       destNone,
-
+		AttributeCloudAccountID:                  usualDests,
+		AttributeMessageDestinationName:          usualDests,
+		AttributeCloudRegion:                     usualDests,
+		AttributeMessageSystem:                   usualDests,
+		AttributeHostDisplayName:                 usualDests,
+		AttributeRequestMethod:                   usualDests,
+		AttributeRequestAccept:                   usualDests,
+		AttributeRequestContentType:              usualDests,
+		AttributeRequestContentLength:            usualDests,
+		AttributeRequestHost:                     usualDests,
+		AttributeRequestUserAgent:                tracesDests,
+		AttributeRequestUserAgentDeprecated:      tracesDests,
+		AttributeRequestReferer:                  tracesDests,
+		AttributeRequestURI:                      usualDests,
+		AttributeResponseContentType:             usualDests,
+		AttributeResponseContentLength:           usualDests,
+		AttributeResponseCode:                    usualDests,
+		AttributeResponseCodeDeprecated:          usualDests,
+		AttributeAWSRequestID:                    usualDests,
+		AttributeAWSLambdaARN:                    usualDests,
+		AttributeAWSLambdaEventSourceEventType:   usualDests,
+		AttributeAWSLambdaColdStart:              usualDests,
+		AttributeAWSLambdaEventSourceARN:         usualDests,
+		AttributeMessageRoutingKey:               usualDests,
+		AttributeMessageQueueName:                usualDests,
+		AttributeMessageHeaders:                  usualDests,
+		AttributeMessageExchangeType:             destNone,
+		AttributeMessageReplyTo:                  destNone,
+		AttributeMessageCorrelationID:            destNone,
+		AttributeCodeFunction:                    usualDests,
+		AttributeCodeNamespace:                   usualDests,
+		AttributeCodeFilepath:                    usualDests,
+		AttributeCodeLineno:                      usualDests,
+		AttributeUserID:                          usualDests,
+		AttributeLLM:                             usualDests,
+		AttributeServerAddress:                   usualDests,
+		AttributeServerPort:                      usualDests,
+		AttributeSpanKind:                        usualDests,
+		AttributeMessagingDestinationPublishName: usualDests,
+		AttributeRabbitMQDestinationRoutingKey:   usualDests,
 		// Span specific attributes
 		SpanAttributeDBStatement:             usualDests,
 		SpanAttributeDBInstance:              usualDests,
@@ -263,11 +285,19 @@ func (a *attributes) GetAgentValue(id string, d destinationSet) (string, interfa
 // otherVal should be populated.  Since most agent attribute values are strings,
 // stringVal exists to avoid allocations.
 func (attr agentAttributes) Add(id string, stringVal string, otherVal interface{}) {
-	if "" != stringVal || otherVal != nil {
+	if stringVal != "" || otherVal != nil {
 		attr[id] = agentAttributeValue{
 			stringVal: truncateStringValueIfLong(stringVal),
 			otherVal:  otherVal,
 		}
+	}
+}
+
+// Remove is used to remove agent attributes.
+// It is not an error if the attribute wasn't present to begin with.
+func (attr agentAttributes) Remove(id string) {
+	if _, ok := attr[id]; ok {
+		delete(attr, id)
 	}
 }
 
@@ -327,12 +357,49 @@ func truncateStringValueIfLong(val string) string {
 	return val
 }
 
+func truncateStringMessageIfLong(message string) string {
+	if len(message) > errorEventMessageLengthLimit {
+		return stringLengthByteLimit(message, errorEventMessageLengthLimit)
+	}
+	return message
+}
+
 // validateUserAttribute validates a user attribute.
 func validateUserAttribute(key string, val interface{}) (interface{}, error) {
 	if str, ok := val.(string); ok {
 		val = interface{}(truncateStringValueIfLong(str))
 	}
 
+	switch v := val.(type) {
+	case string, bool,
+		uint8, uint16, uint32, uint64, int8, int16, int32, int64,
+		uint, int, uintptr:
+	case float32:
+		if err := validateFloat(float64(v), key); err != nil {
+			return nil, err
+		}
+	case float64:
+		if err := validateFloat(v, key); err != nil {
+			return nil, err
+		}
+	default:
+		return nil, errInvalidAttributeType{
+			key: key,
+			val: val,
+		}
+	}
+
+	// Attributes whose keys are excessively long are dropped rather than
+	// truncated to avoid worrying about the application of configuration to
+	// truncated values or performing the truncation after configuration.
+	if len(key) > attributeKeyLengthLimit {
+		return nil, invalidAttributeKeyErr{key: key}
+	}
+	return val, nil
+}
+
+// validateUserAttributeUnlimitedSize validates a user attribute without truncating string values.
+func validateUserAttributeUnlimitedSize(key string, val interface{}) (interface{}, error) {
 	switch v := val.(type) {
 	case string, bool,
 		uint8, uint16, uint32, uint64, int8, int16, int32, int64,
@@ -398,9 +465,27 @@ func addUserAttribute(a *attributes, key string, val interface{}, d destinationS
 }
 
 func writeAttributeValueJSON(w *jsonFieldsWriter, key string, val interface{}) {
+	writeAttributeValueJSONLimit(w, key, val, maxAttributeLengthBytes)
+}
+
+// writeAttributeValueJSONLimit writes an attribute value to JSON, truncating
+// string values (and JSON-marshaled composites) at limit bytes. A limit <= 0
+// disables truncation and preserves the full value; this is required for
+// LlmChatCompletionMessage.content and LlmEmbedding.input per the LLM spec.
+// https://source.datanerd.us/agents/agent-specs/blob/main/artificial_intelligence/LLMs.md#llm-events
+func writeAttributeValueJSONLimit(w *jsonFieldsWriter, key string, val interface{}, limit int) {
 	switch v := val.(type) {
 	case string:
+		if limit > 0 && len(v) > limit {
+			v = v[:limit]
+		}
 		w.stringField(key, v)
+	case error:
+		value := v.Error()
+		if limit > 0 && len(value) > limit {
+			value = value[:limit]
+		}
+		w.stringField(key, value)
 	case bool:
 		if v {
 			w.rawField(key, `true`)
@@ -433,20 +518,41 @@ func writeAttributeValueJSON(w *jsonFieldsWriter, key string, val interface{}) {
 		w.floatField(key, float64(v))
 	case float64:
 		w.floatField(key, v)
+	case time.Time:
+		writeAttributeValueJSONLimit(w, key, v.String(), limit)
+	case time.Duration:
+		writeAttributeValueJSONLimit(w, key, v.String(), limit)
+	case time.Weekday:
+		writeAttributeValueJSONLimit(w, key, v.String(), limit)
+	case *time.Location:
+		writeAttributeValueJSONLimit(w, key, v.String(), limit)
+	case time.Month:
+		writeAttributeValueJSONLimit(w, key, v.String(), limit)
 	default:
-		w.stringField(key, fmt.Sprintf("%T", v))
+		// attempt to construct a JSON string
+		kind := reflect.ValueOf(v).Kind()
+		if kind == reflect.Struct || kind == reflect.Map || kind == reflect.Slice || kind == reflect.Array {
+			bytes, _ := json.Marshal(v)
+			if limit > 0 && len(bytes) > limit {
+				bytes = bytes[:limit]
+			}
+			w.stringField(key, string(bytes))
+		} else {
+			w.stringField(key, fmt.Sprintf("%T", v))
+		}
 	}
 }
 
-func agentAttributesJSON(a *attributes, buf *bytes.Buffer, d destinationSet) {
-	if nil == a {
+func agentAttributesJSON(a *attributes, buf *bytes.Buffer, d destinationSet, additionalAttributes ...map[string]string) {
+	if a == nil {
 		buf.WriteString("{}")
 		return
 	}
+
 	w := jsonFieldsWriter{buf: buf}
 	buf.WriteByte('{')
 	for id, val := range a.Agent {
-		if 0 != a.config.agentDests[id]&d {
+		if a.config.agentDests[id]&d != 0 {
 			if val.stringVal != "" {
 				w.stringField(id, val.stringVal)
 			} else {
@@ -454,8 +560,15 @@ func agentAttributesJSON(a *attributes, buf *bytes.Buffer, d destinationSet) {
 			}
 		}
 	}
-	buf.WriteByte('}')
 
+	// Add additional agent attributes to json
+	for _, additionalAttribute := range additionalAttributes {
+		for id, val := range additionalAttribute {
+			w.stringField(id, val)
+		}
+	}
+
+	buf.WriteByte('}')
 }
 
 func userAttributesJSON(a *attributes, buf *bytes.Buffer, d destinationSet, extraAttributes map[string]interface{}) {
@@ -464,12 +577,12 @@ func userAttributesJSON(a *attributes, buf *bytes.Buffer, d destinationSet, extr
 		w := jsonFieldsWriter{buf: buf}
 		for key, val := range extraAttributes {
 			outputDest := applyAttributeConfig(a.config, key, d)
-			if 0 != outputDest&d {
+			if outputDest&d != 0 {
 				writeAttributeValueJSON(&w, key, val)
 			}
 		}
 		for name, atr := range a.user {
-			if 0 != atr.dests&d {
+			if atr.dests&d != 0 {
 				if _, found := extraAttributes[name]; found {
 					continue
 				}

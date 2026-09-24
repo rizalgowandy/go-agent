@@ -1,6 +1,7 @@
 // Copyright 2020 New Relic Corporation. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+//go:build go1.13
 // +build go1.13
 
 package newrelic
@@ -25,7 +26,7 @@ func TestNoticedWrappedError(t *testing.T) {
 	beta := func() error { return fmt.Errorf("problem in beta: %w", gamma()) }
 	alpha := func() error { return fmt.Errorf("problem in alpha: %w", beta()) }
 
-	app := testApp(nil, nil, t)
+	app := testApp(nil, ConfigDistributedTracerEnabled(false), t)
 	txn := app.StartTransaction("hello")
 	txn.NoticeError(alpha())
 	app.expectNoLoggedErrors(t)

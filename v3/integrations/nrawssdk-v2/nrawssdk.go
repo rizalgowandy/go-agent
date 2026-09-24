@@ -28,18 +28,41 @@ package nrawssdk
 
 import (
 	"context"
+	"encoding/base32"
+	"fmt"
+	"net/url"
 	"strconv"
+	"strings"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	awsmiddle "github.com/aws/aws-sdk-go-v2/aws/middleware"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/service/sqs"
+	"github.com/aws/smithy-go/middleware"
 	smithymiddle "github.com/aws/smithy-go/middleware"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
-	"github.com/newrelic/go-agent/v3/internal/integrationsupport"
 	"github.com/newrelic/go-agent/v3/newrelic"
+	"github.com/newrelic/go-agent/v3/newrelic/integrationsupport"
 )
 
-type nrMiddleware struct {
-	txn *newrelic.Transaction
+type credentialsResolver interface {
+	AWSAccountIdFromAWSAccessKey(creds aws.Credentials) (string, error)
 }
+
+type nrMiddleware struct {
+	txn       *newrelic.Transaction
+	accountID string
+	resolver  credentialsResolver
+}
+
+type defaultResolver struct{}
+
+type contextKey string
+
+const (
+	dynamodbInputKey contextKey = "DynamoDBInput"
+	queueURLKey      contextKey = "QueueURL"
+)
 
 type endable interface{ End() }
 
@@ -56,19 +79,24 @@ func (m nrMiddleware) deserializeMiddleware(stack *smithymiddle.Stack) error {
 		}
 
 		smithyRequest := in.Request.(*smithyhttp.Request)
-
 		// The actual http.Request is inside the smithyhttp.Request
 		httpRequest := smithyRequest.Request
 		serviceName := awsmiddle.GetServiceID(ctx)
 		operation := awsmiddle.GetOperationName(ctx)
 		region := awsmiddle.GetRegion(ctx)
-
+		accountID := m.accountID
 		var segment endable
-		// Service name capitalization is different for v1 and v2.
+
 		if serviceName == "dynamodb" || serviceName == "DynamoDB" {
+			input, _ := ctx.Value(dynamodbInputKey).(dynamodbInput)
+			collection := input.tableName
+			if input.indexName != "" {
+				collection += "." + input.indexName
+			}
+
 			segment = &newrelic.DatastoreSegment{
 				Product:            newrelic.DatastoreDynamoDB,
-				Collection:         "", // AWS SDK V2 doesn't expose TableName
+				Collection:         collection,
 				Operation:          operation,
 				ParameterizedQuery: "",
 				QueryParameters:    nil,
@@ -88,7 +116,29 @@ func (m nrMiddleware) deserializeMiddleware(stack *smithymiddle.Stack) error {
 		response, ok := out.RawResponse.(*smithyhttp.Response)
 
 		if ok {
-			// Set additional span attributes
+			if serviceName == "sqs" || serviceName == "SQS" {
+				if queueURL, ok := ctx.Value(queueURLKey).(string); ok {
+					parsedURL, err := url.Parse(queueURL)
+					if err == nil {
+						// Example URL: https://sqs.{region}.amazonaws.com/{account.id}/{queue.name}
+						pathParts := strings.Split(parsedURL.Path, "/")
+						if len(pathParts) >= 3 {
+							accountID := pathParts[1]
+							queueName := pathParts[2]
+							integrationsupport.AddAgentSpanAttribute(txn, newrelic.AttributeCloudAccountID, accountID)
+							integrationsupport.AddAgentSpanAttribute(txn, newrelic.AttributeCloudRegion, region)
+							integrationsupport.AddAgentSpanAttribute(txn, newrelic.AttributeMessageSystem, "aws_sqs")
+							integrationsupport.AddAgentSpanAttribute(txn, newrelic.AttributeMessageDestinationName, queueName)
+						}
+					}
+
+				}
+			}
+			if serviceName == "OpenSearch" || serviceName == "opensearch" {
+				integrationsupport.AddAgentSpanAttribute(txn, newrelic.AttributeAWSElastSearchDomainEndpoint, httpRequest.URL.String())
+			}
+			integrationsupport.AddAgentSpanAttribute(txn, newrelic.AttributeCloudAccountID, accountID)
+
 			integrationsupport.AddAgentSpanAttribute(txn,
 				newrelic.AttributeResponseCode, strconv.Itoa(response.StatusCode))
 			integrationsupport.AddAgentSpanAttribute(txn,
@@ -103,42 +153,207 @@ func (m nrMiddleware) deserializeMiddleware(stack *smithymiddle.Stack) error {
 		}
 		segment.End()
 		return out, metadata, err
-	}),
-		smithymiddle.Before)
+	}), smithymiddle.Before)
 }
 
-// AppendMiddlewares inserts New Relic middleware in the given `apiOptions` for
-// the AWS SDK V2 for Go. It must be called only once per AWS configuration.
-//
-// If `txn` is provided as nil, the New Relic transaction will be retrieved
-// using `newrelic.FromContext`.
-//
-// Additional attributes will be added to transaction trace segments and span
-// events: aws.region, aws.requestId, and aws.operation. In addition,
-// http.statusCode will be added to span events.
-//
-// To see segments and spans for all AWS invocations, call AppendMiddlewares
-// with the AWS Config `apiOptions` and provide nil for `txn`. For example:
-//
-//  awsConfig, err := config.LoadDefaultConfig(ctx)
-//  if err != nil {
-//      log.Fatal(err)
-//  }
-//  nraws.AppendMiddlewares(&awsConfig.APIOptions, nil)
-//
-// If do not want the transaction to be retrived from the context, you can
-// explicitly set `txn`. For example:
-//
-//  awsConfig, err := config.LoadDefaultConfig(ctx)
-//  if err != nil {
-//      log.Fatal(err)
-//  }
-//
-//  ...
-//
-//  txn := loadNewRelicTransaction()
-//  nraws.AppendMiddlewares(&awsConfig.APIOptions, txn)
+func (m nrMiddleware) serializeMiddleware(stack *middleware.Stack) error {
+	return stack.Initialize.Add(middleware.InitializeMiddlewareFunc("NRSerializeMiddleware", func(
+		ctx context.Context, in middleware.InitializeInput, next middleware.InitializeHandler) (
+		out middleware.InitializeOutput, metadata middleware.Metadata, err error) {
+		serviceName := awsmiddle.GetServiceID(ctx)
+		switch serviceName {
+		case "dynamodb", "DynamoDB":
+			ctx = context.WithValue(ctx, dynamodbInputKey, dynamoDBInputFromMiddlewareInput(in))
+		case "sqs", "SQS":
+			ctx = context.WithValue(ctx, queueURLKey, sqsQueueURFromMiddlewareInput(in))
+		}
+		return next.HandleInitialize(ctx, in)
+	}), middleware.After)
+}
+
+// Deprecated: Use InitializeMiddleware instead.  Please note the different parameters used.
 func AppendMiddlewares(apiOptions *[]func(*smithymiddle.Stack) error, txn *newrelic.Transaction) {
 	m := nrMiddleware{txn: txn}
 	*apiOptions = append(*apiOptions, m.deserializeMiddleware)
+	*apiOptions = append(*apiOptions, m.serializeMiddleware)
+}
+
+// InitializeMiddleware registers New Relic middleware in the AWS SDK V2 for Go service stack.
+// It must be called only once per AWS configuration.
+//
+// The New Relic transaction, `txn`, is fetched from the ctx.  Make sure to add the txn to the ctx
+// before passing it in in as a parameter. This can be done with:
+// ctx := newrelic.NewContext(context.Background(), txn)
+//
+// Additional attributes will be added to transaction trace segments and span
+// events: aws.accountId, aws.region, aws.requestId, and aws.operation. In addition,
+// http.statusCode will be added to span events.
+//
+// To see segments and spans for all AWS invocations, call InitializeMiddleware
+// with the aws.Config and provide ctx. For example:
+//
+//	awsConfig, err := config.LoadDefaultConfig(ctx)
+//	if err != nil {
+//		log.Fatal(err)
+//	}
+//	nrawssdk.InitializeMiddleware(awsConfig, ctx, awsConfig.Credentials)
+//
+// The middleware can also be added later, per AWS service call using
+// the `optFns` parameter. For example:
+//
+//	awsConfig, err := config.LoadDefaultConfig(ctx)
+//	if err != nil {
+//		log.Fatal(err)
+//	}
+//
+//	...
+//
+//	s3Client := s3.NewFromConfig(awsConfig)
+//
+//	...
+//
+//	txn := loadNewRelicTransaction()
+//	output, err := s3Client.ListBuckets(ctx, nil, func(o *s3.Options) error {
+//		nrawssdk.InitializeMiddlewares(&o.APIOptions, ctx, wsConfig.Credential)
+//		return nil
+//	})
+//	if err != nil {
+//		log.Fatal(err)
+//	}
+func InitializeMiddleware(apiOptions *[]func(*smithymiddle.Stack) error, ctx context.Context, credentials aws.CredentialsProvider) {
+	txn := newrelic.FromContext(ctx)
+
+	m := nrMiddleware{txn: txn, resolver: &defaultResolver{}}
+
+	m.initializeMiddleware(apiOptions, ctx, credentials)
+}
+
+func (m *nrMiddleware) initializeMiddleware(apiOptions *[]func(*smithymiddle.Stack) error, ctx context.Context, credentials aws.CredentialsProvider) {
+
+	if m.txn == nil {
+		m.txn = newrelic.FromContext(ctx)
+	}
+	cfg, ok := m.txn.Application().Config()
+	// if the nr config has not been intialized yet, don't try to resolve the credentials
+	if ok {
+		creds, err := credentials.Retrieve(ctx)
+		if err != nil {
+			cfg.Logger.Error(err.Error(), map[string]any{})
+		}
+
+		err = m.ResolveAWSCredentials(cfg, creds)
+		if err != nil {
+			cfg.Logger.Error(err.Error(), map[string]any{})
+		}
+	}
+
+	*apiOptions = append(*apiOptions, m.deserializeMiddleware)
+	*apiOptions = append(*apiOptions, m.serializeMiddleware)
+}
+
+func sqsQueueURFromMiddlewareInput(in middleware.InitializeInput) string {
+	switch params := in.Parameters.(type) {
+	case *sqs.SendMessageInput:
+		return aws.ToString(params.QueueUrl)
+	case *sqs.DeleteQueueInput:
+		return aws.ToString(params.QueueUrl)
+	case *sqs.ReceiveMessageInput:
+		return aws.ToString(params.QueueUrl)
+	case *sqs.DeleteMessageInput:
+		return aws.ToString(params.QueueUrl)
+	case *sqs.ChangeMessageVisibilityInput:
+		return aws.ToString(params.QueueUrl)
+	case *sqs.ChangeMessageVisibilityBatchInput:
+		return aws.ToString(params.QueueUrl)
+	case *sqs.DeleteMessageBatchInput:
+		return aws.ToString(params.QueueUrl)
+	case *sqs.SendMessageBatchInput:
+		return aws.ToString(params.QueueUrl)
+	case *sqs.PurgeQueueInput:
+		return aws.ToString(params.QueueUrl)
+	case *sqs.GetQueueAttributesInput:
+		return aws.ToString(params.QueueUrl)
+	case *sqs.SetQueueAttributesInput:
+		return aws.ToString(params.QueueUrl)
+	case *sqs.TagQueueInput:
+		return aws.ToString(params.QueueUrl)
+	case *sqs.UntagQueueInput:
+		return aws.ToString(params.QueueUrl)
+	default:
+		return ""
+	}
+}
+
+type dynamodbInput struct {
+	tableName string
+	indexName string
+}
+
+func dynamoDBInputFromMiddlewareInput(in middleware.InitializeInput) dynamodbInput {
+	switch params := in.Parameters.(type) {
+	case *dynamodb.DeleteItemInput:
+		return dynamodbInput{tableName: aws.ToString(params.TableName)}
+	case *dynamodb.GetItemInput:
+		return dynamodbInput{tableName: aws.ToString(params.TableName)}
+	case *dynamodb.PutItemInput:
+		return dynamodbInput{tableName: aws.ToString(params.TableName)}
+	case *dynamodb.QueryInput:
+		return dynamodbInput{tableName: aws.ToString(params.TableName), indexName: aws.ToString(params.IndexName)}
+	case *dynamodb.ScanInput:
+		return dynamodbInput{tableName: aws.ToString(params.TableName), indexName: aws.ToString(params.IndexName)}
+	case *dynamodb.UpdateItemInput:
+		return dynamodbInput{tableName: aws.ToString(params.TableName)}
+	default:
+		return dynamodbInput{}
+	}
+}
+
+func (m *nrMiddleware) ResolveAWSCredentials(cfg newrelic.Config, creds aws.Credentials) error {
+
+	// use cfg accountID or use cfg accountID if account decoding is disabled
+	if cfg.CloudAWS.AccountID != "" || !cfg.CloudAWS.AccountDecoding.Enabled {
+		m.accountID = cfg.CloudAWS.AccountID
+		return nil
+	}
+
+	if m.resolver == nil {
+		m.resolver = &defaultResolver{}
+	}
+	accountID, err := m.resolver.AWSAccountIdFromAWSAccessKey(creds)
+	if err != nil {
+		// return err, aws account id remains empty
+		return err
+	}
+
+	// Otherwise use the resolved accountID
+	m.accountID = accountID
+	return nil
+}
+
+func (m *defaultResolver) AWSAccountIdFromAWSAccessKey(creds aws.Credentials) (string, error) {
+	if creds.AccountID != "" {
+		return creds.AccountID, nil
+	}
+	if creds.AccessKeyID == "" {
+		return "", fmt.Errorf("no access key id found")
+	}
+	if len(creds.AccessKeyID) < 16 {
+		return "", fmt.Errorf("improper access key id format")
+	}
+	trimmedAccessKey := creds.AccessKeyID[4:]
+	decoded, err := base32.StdEncoding.DecodeString(trimmedAccessKey)
+	if err != nil {
+		return "", fmt.Errorf("error decoding access keys")
+	}
+	var bigEndian uint64
+	for i := 0; i < 6; i++ {
+		bigEndian = bigEndian << 8      // shift 8 bits left.  Most significant byte read in first (decoded[i])
+		bigEndian |= uint64(decoded[i]) // apply OR for current byte
+	}
+
+	mask := uint64(0x7fffffffff80)
+
+	num := (bigEndian & mask) >> 7 // apply mask and get rid of last 7 bits from mask
+
+	return fmt.Sprintf("%d", num), nil
 }

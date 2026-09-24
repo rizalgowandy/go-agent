@@ -1,6 +1,7 @@
 // Copyright 2020 New Relic Corporation. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+//go:build go1.10
 // +build go1.10
 
 package newrelic
@@ -95,7 +96,7 @@ var (
 
 func TestDriverStmtExecContext(t *testing.T) {
 	// Test that driver.Stmt.ExecContext calls get instrumented.
-	app := testApp(nil, nil, t)
+	app := testApp(nil, ConfigDistributedTracerEnabled(false), t)
 	dr := InstrumentSQLDriver(testDriver{}, testBuilder)
 	txn := app.StartTransaction("hello")
 	conn, _ := dr.Open("myhost,myport,mydatabase")
@@ -108,7 +109,7 @@ func TestDriverStmtExecContext(t *testing.T) {
 
 func TestDriverStmtQueryContext(t *testing.T) {
 	// Test that driver.Stmt.PrepareContext calls get instrumented.
-	app := testApp(nil, nil, t)
+	app := testApp(nil, ConfigDistributedTracerEnabled(false), t)
 	dr := InstrumentSQLDriver(testDriver{}, testBuilder)
 	txn := app.StartTransaction("hello")
 	conn, _ := dr.Open("myhost,myport,mydatabase")
@@ -121,7 +122,7 @@ func TestDriverStmtQueryContext(t *testing.T) {
 
 func TestDriverConnExecContext(t *testing.T) {
 	// Test that driver.Conn.ExecContext calls get instrumented.
-	app := testApp(nil, nil, t)
+	app := testApp(nil, ConfigDistributedTracerEnabled(false), t)
 	dr := InstrumentSQLDriver(testDriver{}, testBuilder)
 	txn := app.StartTransaction("hello")
 	conn, _ := dr.Open("myhost,myport,mydatabase")
@@ -133,7 +134,7 @@ func TestDriverConnExecContext(t *testing.T) {
 
 func TestDriverConnQueryContext(t *testing.T) {
 	// Test that driver.Conn.QueryContext calls get instrumented.
-	app := testApp(nil, nil, t)
+	app := testApp(nil, ConfigDistributedTracerEnabled(false), t)
 	dr := InstrumentSQLDriver(testDriver{}, testBuilder)
 	txn := app.StartTransaction("hello")
 	conn, _ := dr.Open("myhost,myport,mydatabase")
@@ -145,7 +146,7 @@ func TestDriverConnQueryContext(t *testing.T) {
 
 func TestDriverContext(t *testing.T) {
 	// Test that driver.OpenConnector returns an instrumented connector.
-	app := testApp(nil, nil, t)
+	app := testApp(nil, ConfigDistributedTracerEnabled(false), t)
 	dr := InstrumentSQLDriver(testDriver{}, testBuilder)
 	txn := app.StartTransaction("hello")
 	connector, _ := dr.(driver.DriverContext).OpenConnector("myhost,myport,mydatabase")
@@ -159,7 +160,7 @@ func TestDriverContext(t *testing.T) {
 func TestInstrumentSQLConnector(t *testing.T) {
 	// Test that connections returned by an instrumented driver.Connector
 	// are instrumented.
-	app := testApp(nil, nil, t)
+	app := testApp(nil, ConfigDistributedTracerEnabled(false), t)
 	bld := testBuilder
 	bld.BaseSegment.Host = "myhost"
 	bld.BaseSegment.PortPathOrID = "myport"
@@ -175,7 +176,7 @@ func TestInstrumentSQLConnector(t *testing.T) {
 
 func TestConnectorToDriver(t *testing.T) {
 	// Test that driver.Connector.Driver returns an instrumented Driver.
-	app := testApp(nil, nil, t)
+	app := testApp(nil, ConfigDistributedTracerEnabled(false), t)
 	connector := InstrumentSQLConnector(testConnector{}, testBuilder)
 	txn := app.StartTransaction("hello")
 	dr := connector.Driver()

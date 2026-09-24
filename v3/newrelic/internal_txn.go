@@ -40,6 +40,11 @@ type txn struct {
 
 	mainThread   tracingThread
 	asyncThreads []*tracingThread
+
+	// csecData is used to propagate HTTP request context in async apps,
+	// when NewGoroutine is called.
+	csecData       any
+	csecAttributes map[string]any
 }
 
 type thread struct {
@@ -47,6 +52,14 @@ type thread struct {
 	// thread does not have locking because it should only be accessed while
 	// the txn is locked.
 	thread *tracingThread
+}
+
+func (thd *thread) IsEnded() bool {
+	txn := thd.txn
+	txn.Lock()
+	defer txn.Unlock()
+
+	return txn.finished
 }
 
 func (txn *txn) markStart(now time.Time) {
@@ -78,20 +91,49 @@ func (txn *txn) markEnd(now time.Time, thread *tracingThread) {
 	}
 }
 
-func newTxn(app *app, run *appRun, name string) *thread {
+func (txn *txn) setOption(opts ...TraceOption) {
+	txnOpts := traceOptSet{}
+	for _, o := range opts {
+		o(&txnOpts)
+	}
+
+	// If we are suppressing code-level metrics but had already set up to report them,
+	// remove those attributes now entirely. We've already spent the time to collect
+	// the data, but that's water under the bridge at this point and the user is saying
+	// explicitly they don't want them.
+	if txnOpts.SuppressCLM {
+		removeCodeLevelMetrics(txn.Attrs.Agent.Remove)
+	} else if txn.appRun != nil && txn.appRun.Config.CodeLevelMetrics.Enabled && (txn.appRun.Config.CodeLevelMetrics.Scope == 0 || (txn.appRun.Config.CodeLevelMetrics.Scope&TransactionCLM) != 0) {
+		// If we're given an explicit code location to report, do that now. This will override
+		// any previous code-level metrics information in the transaction.
+		reportCodeLevelMetrics(txnOpts, txn.appRun, txn.Attrs.Agent.Add)
+	}
+}
+
+func newTxn(app *app, run *appRun, name string, opts ...TraceOption) *thread {
 	txn := &txn{
 		app:    app,
 		appRun: run,
+	}
+	txnOpts := traceOptSet{}
+	for _, o := range opts {
+		o(&txnOpts)
 	}
 	txn.markStart(time.Now())
 
 	txn.Name = name
 	txn.Attrs = newAttributes(run.AttributeConfig)
 
+	if !txnOpts.SuppressCLM && run.Config.CodeLevelMetrics.Enabled && (txnOpts.DemandCLM || run.Config.CodeLevelMetrics.Scope == 0 || (run.Config.CodeLevelMetrics.Scope&TransactionCLM) != 0) {
+		reportCodeLevelMetrics(txnOpts, run, txn.Attrs.Agent.Add)
+	}
+	txn.TraceIDGenerator = run.Reply.TraceIDGenerator
+	traceID := txn.TraceIDGenerator.GenerateTraceID()
+	txn.SetTransactionID(traceID)
+
 	if run.Config.DistributedTracer.Enabled {
 		txn.BetterCAT.Enabled = true
-		txn.TraceIDGenerator = run.Reply.TraceIDGenerator
-		txn.BetterCAT.SetTraceAndTxnIDs(txn.TraceIDGenerator.GenerateTraceID())
+		txn.BetterCAT.SetTraceAndTxnIDs(traceID)
 		txn.BetterCAT.Priority = newPriorityFromRandom(txn.TraceIDGenerator.Float32)
 		txn.ShouldCollectSpanEvents = txn.shouldCollectSpanEvents
 		txn.ShouldCreateSpanGUID = txn.shouldCreateSpanGUID
@@ -226,18 +268,34 @@ func (thd *thread) SetWebResponse(w http.ResponseWriter) http.ResponseWriter {
 	})
 }
 
+func (thd *thread) StoreLog(log *logEvent) {
+	txn := thd.txn
+	txn.Lock()
+	defer txn.Unlock()
+
+	//	might want to refactor to return errAlreadyEnded
+	if txn.finished {
+		return
+	}
+
+	if txn.logs == nil {
+		txn.logs = make(logEventHeap, 0, internal.MaxLogEvents)
+	}
+	txn.logs.Add(log)
+}
+
 func (txn *txn) freezeName() {
-	if txn.ignore || ("" != txn.FinalName) {
+	if txn.ignore || (txn.FinalName != "") {
 		return
 	}
 	txn.FinalName = txn.appRun.createTransactionName(txn.Name, txn.IsWeb)
-	if "" == txn.FinalName {
+	if txn.FinalName == "" {
 		txn.ignore = true
 	}
 }
 
 func (txn *txn) getsApdex() bool {
-	return txn.IsWeb
+	return txn.IsWeb && !txn.ignoreApdex
 }
 
 func (txn *txn) shouldSaveTrace() bool {
@@ -251,7 +309,6 @@ func (txn *txn) shouldSaveTrace() bool {
 }
 
 func (txn *txn) MergeIntoHarvest(h *harvest) {
-
 	var priority priority
 	if txn.BetterCAT.Enabled {
 		priority = txn.BetterCAT.Priority
@@ -262,6 +319,13 @@ func (txn *txn) MergeIntoHarvest(h *harvest) {
 	createTxnMetrics(&txn.txnData, h.Metrics)
 	mergeBreakdownMetrics(&txn.txnData, h.Metrics)
 
+	// Dump log events into harvest
+	// Note: this will create a surge of log events that could affect sampling.
+	for _, logEvent := range txn.logs {
+		logEvent.priority = priority
+		h.LogEvents.Add(&logEvent)
+	}
+
 	if txn.Config.TransactionEvents.Enabled {
 		// Allocate a new TxnEvent to prevent a reference to the large transaction.
 		alloc := new(txnEvent)
@@ -269,27 +333,39 @@ func (txn *txn) MergeIntoHarvest(h *harvest) {
 		h.TxnEvents.AddTxnEvent(alloc, priority)
 	}
 
+	hs := &highSecuritySettings{txn.Config.HighSecurity, txn.Reply.SecurityPolicies.AllowRawExceptionMessages.Enabled()}
+
+	if (txn.Reply.CollectErrors || txn.Config.ErrorCollector.CaptureEvents) && txn.Config.ErrorCollector.ErrorGroupCallback != nil {
+		txn.txnEvent.errGroupCallback = txn.Config.ErrorCollector.ErrorGroupCallback
+		for _, e := range txn.Errors {
+			e.applyErrorGroup(&txn.txnEvent)
+		}
+	}
+
 	if txn.Reply.CollectErrors {
-		mergeTxnErrors(&h.ErrorTraces, txn.Errors, txn.txnEvent)
+		mergeTxnErrors(&h.ErrorTraces, txn.Errors, txn.txnEvent, hs)
 	}
 
 	if txn.Config.ErrorCollector.CaptureEvents {
 		for _, e := range txn.Errors {
+			e.scrubErrorForHighSecurity(hs)
 			errEvent := &errorEvent{
 				errorData: *e,
 				txnEvent:  txn.txnEvent,
 			}
-			// Since the stack trace is not used in error events, remove the reference
+			// Since the stack trace and raw error object is not used in error events, remove the reference
 			// to minimize memory.
 			errEvent.Stack = nil
+			errEvent.RawError = nil
 			h.ErrorEvents.Add(errEvent, priority)
 		}
 	}
 
 	if txn.shouldSaveTrace() {
 		h.TxnTraces.Witness(harvestTrace{
-			txnEvent: txn.txnEvent,
-			Trace:    txn.TxnTrace,
+			txnEvent:  txn.txnEvent,
+			Trace:     txn.TxnTrace,
+			asyncWork: len(txn.asyncThreads) > 0,
 		})
 	}
 
@@ -321,7 +397,9 @@ func headersJustWritten(thd *thread, code int, hdr http.Header) {
 	if txn.appRun.responseCodeIsError(code) {
 		e := txnErrorFromResponseCode(time.Now(), code)
 		e.Stack = getStackTrace()
-		thd.noticeErrorInternal(e)
+		expect := txn.appRun.responseCodeIsExpected(code)
+		e.Expect = expect
+		thd.noticeErrorInternal(e, nil, expect)
 	}
 }
 
@@ -377,10 +455,10 @@ func (thd *thread) End(recovered interface{}) error {
 
 	txn.finished = true
 
-	if nil != recovered {
+	if recovered != nil {
 		e := txnErrorFromPanic(time.Now(), recovered)
 		e.Stack = getStackTrace()
-		thd.noticeErrorInternal(e)
+		thd.noticeErrorInternal(e, nil, false)
 		log.Println(string(debug.Stack()))
 	}
 
@@ -402,7 +480,7 @@ func (thd *thread) End(recovered interface{}) error {
 	txn.ApdexThreshold = internal.CalculateApdexThreshold(txn.Reply, txn.FinalName)
 
 	if txn.getsApdex() {
-		if txn.HasErrors() {
+		if txn.HasErrors() && txn.NoticeErrors() {
 			txn.Zone = apdexFailing
 		} else {
 			txn.Zone = calculateApdexZone(txn.ApdexThreshold, txn.Duration)
@@ -416,7 +494,7 @@ func (thd *thread) End(recovered interface{}) error {
 			"name":          txn.FinalName,
 			"duration_ms":   txn.Duration.Seconds() * 1000.0,
 			"ignored":       txn.ignore,
-			"app_connected": "" != txn.Reply.RunID,
+			"app_connected": txn.Reply.RunID != "",
 		})
 	}
 
@@ -435,8 +513,9 @@ func (thd *thread) End(recovered interface{}) error {
 
 		if txn.rootSpanErrData != nil {
 			root.AgentAttributes.addString(SpanAttributeErrorClass, txn.rootSpanErrData.Klass)
-			root.AgentAttributes.addString(SpanAttributeErrorMessage, txn.rootSpanErrData.Msg)
+			root.AgentAttributes.addString(SpanAttributeErrorMessage, scrubbedErrorMessage(txn.rootSpanErrData.Msg, txn))
 		}
+
 		if p := txn.BetterCAT.Inbound; nil != p {
 			root.ParentID = txn.BetterCAT.Inbound.ID
 			root.TrustedParentID = txn.BetterCAT.Inbound.TrustedParentID
@@ -457,7 +536,7 @@ func (thd *thread) End(recovered interface{}) error {
 		// segments occur.
 		for _, evt := range txn.SpanEvents {
 			evt.TraceID = txn.BetterCAT.TraceID
-			evt.TransactionID = txn.BetterCAT.TxnID
+			evt.TransactionID = txn.TxnID
 			evt.Sampled = txn.BetterCAT.Sampled
 			evt.Priority = txn.BetterCAT.Priority
 		}
@@ -472,12 +551,21 @@ func (thd *thread) End(recovered interface{}) error {
 		}
 	}
 
-	// Note that if a consumer uses `panic(nil)`, the panic will not
-	// propagate.
-	if nil != recovered {
+	if recovered != nil {
 		panic(recovered)
 	}
 
+	return nil
+}
+
+func (txn *txn) AddUserID(userID string) error {
+	txn.Lock()
+	defer txn.Unlock()
+	if txn.finished {
+		return errAlreadyEnded
+	}
+
+	txn.Attrs.Agent.Add(AttributeUserID, userID, nil)
 	return nil
 }
 
@@ -514,29 +602,30 @@ const (
 	securityPolicyErrorMsg = "message removed by security policy"
 )
 
-func (thd *thread) noticeErrorInternal(err errorData) error {
+func (thd *thread) noticeErrorInternal(errData errorData, err error, expect bool) error {
 	txn := thd.txn
 	if !txn.Config.ErrorCollector.Enabled {
 		return errorsDisabled
+	}
+
+	if !expect {
+		thd.noticeErrors = true
+	} else {
+		thd.expectedErrors = true
 	}
 
 	if nil == txn.Errors {
 		txn.Errors = newTxnErrors(maxTxnErrors)
 	}
 
-	if txn.Config.HighSecurity {
-		err.Msg = highSecurityErrorMsg
-	}
-
-	if !txn.Reply.SecurityPolicies.AllowRawExceptionMessages.Enabled() {
-		err.Msg = securityPolicyErrorMsg
-	}
+	errData.RawError = err
 
 	if txn.shouldCollectSpanEvents() {
-		err.SpanID = txn.CurrentSpanIdentifier(thd.thread)
-		addErrorAttrs(thd, err)
+		errData.SpanID = txn.CurrentSpanIdentifier(thd.thread)
+		addErrorAttrs(thd, errData)
 	}
-	txn.Errors.Add(err)
+
+	txn.Errors.Add(errData)
 	txn.txnData.txnEvent.HasError = true //mark transaction as having an error
 	return nil
 }
@@ -556,7 +645,7 @@ func addErrorAttrs(t *thread, err errorData) {
 		t.thread.RemoveErrorSpanAttribute(attr)
 	}
 	t.thread.AddAgentSpanAttribute(SpanAttributeErrorClass, err.Klass)
-	t.thread.AddAgentSpanAttribute(SpanAttributeErrorMessage, err.Msg)
+	t.thread.AddAgentSpanAttribute(SpanAttributeErrorMessage, scrubbedErrorMessage(err.Msg, t.txn))
 }
 
 var (
@@ -598,18 +687,19 @@ func errorAttributesMethod(err error) map[string]interface{} {
 	return nil
 }
 
-func errDataFromError(input error) (data errorData, err error) {
+func errDataFromError(input error, expect bool) (data errorData, err error) {
 	cause := errorCause(input)
-
+	validatedErrorMsg := truncateStringMessageIfLong(input.Error())
 	data = errorData{
-		When: time.Now(),
-		Msg:  input.Error(),
+		When:   time.Now(),
+		Msg:    validatedErrorMsg,
+		Expect: expect,
 	}
 
-	if c := errorClassMethod(input); "" != c {
+	if c := errorClassMethod(input); c != "" {
 		// If the error implements ErrorClasser, use that.
 		data.Klass = c
-	} else if c := errorClassMethod(cause); "" != c {
+	} else if c := errorClassMethod(cause); c != "" {
 		// Otherwise, if the error's cause implements ErrorClasser, use that.
 		data.Klass = c
 	} else {
@@ -655,7 +745,7 @@ func errDataFromError(input error) (data errorData, err error) {
 	return data, nil
 }
 
-func (thd *thread) NoticeError(input error) error {
+func (thd *thread) NoticeError(input error, expect bool) error {
 	txn := thd.txn
 	txn.Lock()
 	defer txn.Unlock()
@@ -668,7 +758,7 @@ func (thd *thread) NoticeError(input error) error {
 		return errNilError
 	}
 
-	data, err := errDataFromError(input)
+	data, err := errDataFromError(input, expect)
 	if nil != err {
 		return err
 	}
@@ -677,7 +767,7 @@ func (thd *thread) NoticeError(input error) error {
 		data.ExtraAttributes = nil
 	}
 
-	return thd.noticeErrorInternal(data)
+	return thd.noticeErrorInternal(data, input, expect)
 }
 
 func (txn *txn) SetName(name string) error {
@@ -692,6 +782,12 @@ func (txn *txn) SetName(name string) error {
 	return nil
 }
 
+func (txn *txn) GetName() string {
+	txn.Lock()
+	defer txn.Unlock()
+	return txn.Name
+}
+
 func (txn *txn) Ignore() error {
 	txn.Lock()
 	defer txn.Unlock()
@@ -700,6 +796,14 @@ func (txn *txn) Ignore() error {
 		return errAlreadyEnded
 	}
 	txn.ignore = true
+	return nil
+}
+
+func (txn *txn) IgnoreApdex() error {
+	txn.Lock()
+	defer txn.Unlock()
+
+	txn.ignoreApdex = true
 	return nil
 }
 
@@ -777,7 +881,7 @@ func (txn *txn) BrowserTimingHeader() (*BrowserTimingHeader, error) {
 			ApplicationID:         txn.Reply.AppID,
 			TransactionName:       name,
 			QueueTimeMillis:       txn.Queuing.Nanoseconds() / (1000 * 1000),
-			ApplicationTimeMillis: time.Now().Sub(txn.Start).Nanoseconds() / (1000 * 1000),
+			ApplicationTimeMillis: time.Since(txn.Start).Nanoseconds() / (1000 * 1000),
 			ObfuscatedAttributes:  attrs,
 			ErrorBeacon:           txn.Reply.ErrorBeacon,
 			Agent:                 txn.Reply.JSAgentFile,
@@ -795,7 +899,6 @@ func (thd *thread) NewGoroutine() *Transaction {
 	txn := thd.txn
 	txn.Lock()
 	defer txn.Unlock()
-
 	if txn.finished {
 		// If the transaction has finished, return the same thread.
 		return newTransaction(thd)
@@ -841,6 +944,9 @@ func endDatastore(s *DatastoreSegment) error {
 	if !txn.Config.DatastoreTracer.QueryParameters.Enabled {
 		s.QueryParameters = nil
 	}
+	if txn.Config.DatastoreTracer.RawQuery.Enabled {
+		s.ParameterizedQuery = s.RawQuery
+	}
 	if txn.Reply.SecurityPolicies.RecordSQL.IsSet() {
 		s.QueryParameters = nil
 		if !txn.Reply.SecurityPolicies.RecordSQL.Enabled() {
@@ -872,7 +978,7 @@ func endDatastore(s *DatastoreSegment) error {
 }
 
 func externalSegmentMethod(s *ExternalSegment) string {
-	if "" != s.Procedure {
+	if s.Procedure != "" {
 		return s.Procedure
 	}
 	r := s.Request
@@ -881,7 +987,7 @@ func externalSegmentMethod(s *ExternalSegment) string {
 	}
 
 	if nil != r {
-		if "" != r.Method {
+		if r.Method != "" {
 			return r.Method
 		}
 		// Golang's http package states that when a client's Request has
@@ -950,7 +1056,7 @@ func endMessage(s *MessageProducerSegment) error {
 		return errAlreadyEnded
 	}
 
-	if "" == s.DestinationType {
+	if s.DestinationType == "" {
 		s.DestinationType = MessageQueue
 	}
 
@@ -1032,7 +1138,7 @@ func (thd *thread) CreateDistributedTracePayload(hdrs http.Header) {
 		return
 	}
 
-	if "" == txn.Reply.AccountID || "" == txn.Reply.TrustedAccountKey {
+	if txn.Reply.AccountID == "" || txn.Reply.TrustedAccountKey == "" {
 		// We can't create a payload:  The application is not yet
 		// connected or serverless distributed tracing configuration was
 		// not provided.
@@ -1054,10 +1160,9 @@ func (thd *thread) CreateDistributedTracePayload(hdrs http.Header) {
 	p.Account = txn.Reply.AccountID
 	p.App = txn.Reply.PrimaryAppID
 	p.TracedID = txn.BetterCAT.TraceID
-	p.Priority = txn.BetterCAT.Priority
 	p.Timestamp.Set(txn.Reply.DistributedTraceTimestampGenerator())
 	p.TrustedAccountKey = txn.Reply.TrustedAccountKey
-	p.TransactionID = txn.BetterCAT.TxnID // Set the transaction ID to the transaction guid.
+	p.TransactionID = txn.TxnID // Set the transaction ID to the transaction guid.
 	if nil != txn.BetterCAT.Inbound {
 		p.NonTrustedTraceState = txn.BetterCAT.Inbound.NonTrustedTraceState
 		p.OriginalTraceState = txn.BetterCAT.Inbound.OriginalTraceState
@@ -1068,6 +1173,35 @@ func (thd *thread) CreateDistributedTracePayload(hdrs http.Header) {
 	p.SetSampled(false)
 	if txn.numPayloadsCreated < maxSampledDistributedPayloads {
 		p.SetSampled(sampled)
+	}
+
+	if p.isSampled() { // trace parent exists and is sampled
+		switch txn.Config.DistributedTracer.Sampler.RemoteParentSampled {
+		case "always_on":
+			p.Priority = 2.0
+			txn.BetterCAT.Priority = p.Priority
+		case "always_off":
+			p.Priority = 0.0
+			txn.BetterCAT.Priority = p.Priority
+		default:
+			// If the remote parent is sampled, we use the priority from the
+			// transaction's adaptive sampler.
+			p.Priority = txn.BetterCAT.Priority
+		}
+	} else {
+		switch txn.Config.DistributedTracer.Sampler.RemoteParentNotSampled {
+		case "always_on":
+			p.Priority = 2.0
+			txn.BetterCAT.Priority = p.Priority
+
+		case "always_off":
+			p.Priority = 0.0
+			txn.BetterCAT.Priority = p.Priority
+		default:
+			// If the remote parent is not sampled, we use the priority from the
+			// transaction's adaptive sampler.
+			p.Priority = txn.BetterCAT.Priority
+		}
 	}
 
 	support.TraceContextCreateSuccess = true
@@ -1132,12 +1266,12 @@ func (txn *txn) acceptDistributedTraceHeadersLocked(t TransportType, hdrs http.H
 		return errAlreadyAccepted
 	}
 
-	if nil == hdrs {
+	if hdrs == nil {
 		support.AcceptPayloadNullPayload = true
 		return nil
 	}
 
-	if "" == txn.Reply.AccountID || "" == txn.Reply.TrustedAccountKey {
+	if txn.Reply.AccountID == "" || txn.Reply.TrustedAccountKey == "" {
 		// We can't accept a payload:  The application is not yet
 		// connected or serverless distributed tracing configuration was
 		// not provided.
@@ -1147,17 +1281,17 @@ func (txn *txn) acceptDistributedTraceHeadersLocked(t TransportType, hdrs http.H
 	txn.BetterCAT.TransportType = t.toString()
 
 	payload, err := acceptPayload(hdrs, txn.Reply.TrustedAccountKey, support)
-	if nil != err {
+	if err != nil {
 		return err
 	}
 
-	if nil == payload {
+	if payload == nil {
 		return nil
 	}
 
 	// and let's also do our trustedKey check
 	receivedTrustKey := payload.TrustedAccountKey
-	if "" == receivedTrustKey {
+	if receivedTrustKey == "" {
 		receivedTrustKey = payload.Account
 	}
 
@@ -1169,7 +1303,7 @@ func (txn *txn) acceptDistributedTraceHeadersLocked(t TransportType, hdrs http.H
 		return errTrustedAccountKey
 	}
 
-	if 0 != payload.Priority {
+	if payload.Priority != 0 {
 		txn.BetterCAT.Priority = payload.Priority
 	}
 
@@ -1207,7 +1341,7 @@ func (thd *thread) AddUserSpanAttribute(key string, val interface{}) error {
 	txn.Lock()
 	defer txn.Unlock()
 
-	if outputDests := applyAttributeConfig(thd.Attrs.config, key, destSpan); 0 == outputDests {
+	if outputDests := applyAttributeConfig(thd.Attrs.config, key, destSpan); outputDests == 0 {
 		return nil
 	}
 
@@ -1281,4 +1415,36 @@ func (txn *txn) IsSampled() bool {
 	}
 
 	return txn.lazilyCalculateSampled()
+}
+
+func (txn *txn) getCsecData() any {
+	txn.Lock()
+	defer txn.Unlock()
+	return txn.csecData
+}
+
+func (txn *txn) setCsecData() {
+	txn.Lock()
+	defer txn.Unlock()
+	if txn.csecData == nil && IsSecurityAgentPresent() {
+		txn.csecData = secureAgent.SendEvent("NEW_GOROUTINE", "")
+	}
+}
+
+func (txn *txn) getCsecAttributes() map[string]any {
+	txn.Lock()
+	defer txn.Unlock()
+	if txn.csecAttributes == nil {
+		return map[string]any{}
+	}
+	return txn.csecAttributes
+}
+
+func (txn *txn) setCsecAttributes(key string, value any) {
+	txn.Lock()
+	defer txn.Unlock()
+	if txn.csecAttributes == nil {
+		txn.csecAttributes = map[string]any{}
+	}
+	txn.csecAttributes[key] = value
 }

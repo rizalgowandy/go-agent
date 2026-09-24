@@ -12,8 +12,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/newrelic/go-agent/v3/internal"
-	"github.com/newrelic/go-agent/v3/internal/integrationsupport"
 	"github.com/newrelic/go-agent/v3/newrelic"
+	"github.com/newrelic/go-agent/v3/newrelic/integrationsupport"
 )
 
 var (
@@ -45,8 +45,9 @@ func TestBasicRoute(t *testing.T) {
 		t.Error("wrong response body", respBody)
 	}
 	app.ExpectTxnMetrics(t, internal.WantTxn{
-		Name:  txnName,
-		IsWeb: true,
+		Name:          txnName,
+		IsWeb:         true,
+		UnknownCaller: true,
 	})
 }
 
@@ -72,8 +73,9 @@ func TestRouterGroup(t *testing.T) {
 		t.Error("wrong response body", respBody)
 	}
 	app.ExpectTxnMetrics(t, internal.WantTxn{
-		Name:  txnName,
-		IsWeb: true,
+		Name:          txnName,
+		IsWeb:         true,
+		UnknownCaller: true,
 	})
 }
 
@@ -100,8 +102,9 @@ func TestAnonymousHandler(t *testing.T) {
 		t.Error("wrong response body", respBody)
 	}
 	app.ExpectTxnMetrics(t, internal.WantTxn{
-		Name:  txnName,
-		IsWeb: true,
+		Name:          txnName,
+		IsWeb:         true,
+		UnknownCaller: true,
 	})
 }
 
@@ -139,9 +142,11 @@ func TestMultipleWriteHeader(t *testing.T) {
 	}
 	// Error metrics test the 500 response code capture.
 	app.ExpectTxnMetrics(t, internal.WantTxn{
-		Name:      txnName,
-		IsWeb:     true,
-		NumErrors: 1,
+		Name:          txnName,
+		IsWeb:         true,
+		NumErrors:     1,
+		UnknownCaller: true,
+		ErrorByCaller: true,
 	})
 }
 
@@ -175,9 +180,11 @@ func TestContextTransaction(t *testing.T) {
 		t.Error("wrong response code", response.Code)
 	}
 	app.ExpectTxnMetrics(t, internal.WantTxn{
-		Name:      txnName,
-		IsWeb:     true,
-		NumErrors: 1,
+		Name:          txnName,
+		IsWeb:         true,
+		NumErrors:     1,
+		UnknownCaller: true,
+		ErrorByCaller: true,
 	})
 }
 
@@ -264,6 +271,11 @@ func TestStatusCodes(t *testing.T) {
 		Intrinsics: map[string]interface{}{
 			"name":             txnName,
 			"nr.apdexPerfZone": internal.MatchAnything,
+			"sampled":          false,
+			// Note: "*" is a wildcard value
+			"guid":     "*",
+			"traceId":  "*",
+			"priority": "*",
 		},
 		UserAttributes: map[string]interface{}{},
 		AgentAttributes: map[string]interface{}{
@@ -272,6 +284,10 @@ func TestStatusCodes(t *testing.T) {
 			"request.method":               "GET",
 			"request.uri":                  "/err",
 			"response.headers.contentType": "text/plain; charset=utf-8",
+			"code.function":                internal.MatchAnything,
+			"code.namespace":               internal.MatchAnything,
+			"code.filepath":                internal.MatchAnything,
+			"code.lineno":                  internal.MatchAnything,
 		},
 	}})
 }
@@ -313,13 +329,23 @@ func TestNoResponseBody(t *testing.T) {
 		Intrinsics: map[string]interface{}{
 			"name":             txnName,
 			"nr.apdexPerfZone": internal.MatchAnything,
+			"sampled":          false,
+			// Note: "*" is a wildcard value
+			"guid":     "*",
+			"traceId":  "*",
+			"priority": "*",
 		},
+
 		UserAttributes: map[string]interface{}{},
 		AgentAttributes: map[string]interface{}{
 			"httpResponseCode": expectCode,
 			"http.statusCode":  expectCode,
 			"request.method":   "GET",
 			"request.uri":      "/nobody",
+			"code.function":    internal.MatchAnything,
+			"code.namespace":   internal.MatchAnything,
+			"code.filepath":    internal.MatchAnything,
+			"code.lineno":      internal.MatchAnything,
 		},
 	}})
 }
@@ -346,8 +372,9 @@ func TestRouteWithParams(t *testing.T) {
 		t.Error("wrong response body", respBody)
 	}
 	app.ExpectTxnMetrics(t, internal.WantTxn{
-		Name:  txnName,
-		IsWeb: true,
+		Name:          txnName,
+		IsWeb:         true,
+		UnknownCaller: true,
 	})
 }
 
@@ -369,7 +396,8 @@ func TestMiddlewareOldNaming(t *testing.T) {
 		t.Error("wrong response body", respBody)
 	}
 	app.ExpectTxnMetrics(t, internal.WantTxn{
-		Name:  txnName,
-		IsWeb: true,
+		Name:          txnName,
+		IsWeb:         true,
+		UnknownCaller: true,
 	})
 }

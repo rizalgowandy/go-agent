@@ -67,7 +67,7 @@ Now, add instrumentation to your Go application to get additional performance da
 * Import any of our [integration packages](https://github.com/newrelic/go-agent#integrations) for out-of-the box support for many popular Go web 
 frameworks and libraries. 
 * [Instrument Transactions](#transactions)
-* [Use Distributed Tracing](#distributed-tracing)
+* [Use Distributed Tracing](#distributed-tracing) (Note that this is on by default.)
 * [(Optional) Instrument Segments](#segments) for an extra level of timing detail
   * External segments are needed for Distributed Tracing
 * Read through the rest of this GUIDE for more instrumentation
@@ -102,6 +102,9 @@ app, err := newrelic.NewApplication(
 
 ## Logging
 
+For information about logs in context, please see [the documentation here](https://docs.newrelic.com/docs/logs/logs-context/logs-in-context).
+As of Go Agent version 3.17.0, we support logs in context with the zerolog integration.
+
 The agent's logging system is designed to be easily extensible.  By default, no
 logging will occur.  To enable logging, use the following config functions
 with an [io.Writer](https://godoc.org/github.com/pkg/io/#Writer):
@@ -124,7 +127,7 @@ app, err := newrelic.NewApplication(
 To log at info level to a file, set:
 
 ```go
-w, err := os.OpenFile("my_log_file", os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+w, err := os.OpenFile("my_log_file", os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
 if nil == err {
     app, _ := newrelic.NewApplication(
         newrelic.ConfigAppName("Your Application Name"),
@@ -134,12 +137,13 @@ if nil == err {
 }
 ```
 
-Popular logging libraries `logrus`, `logxi` and `zap` are supported by
+Popular logging libraries `logrus`, `logxi`, `zap` and `zerolog` are supported by
 integration packages:
 
 * [v3/integrations/nrlogrus](https://godoc.org/github.com/newrelic/go-agent/v3/integrations/nrlogrus/)
 * [v3/integrations/nrlogxi](https://godoc.org/github.com/newrelic/go-agent/v3/integrations/nrlogxi/)
 * [v3/integrations/nrzap](https://godoc.org/github.com/newrelic/go-agent/v3/integrations/nrzap/)
+* [v3/integrations/nrzerolog](https://godoc.org/github.com/newrelic/go-agent/v3/integrations/nrzerolog/)
 
 ## Transactions
 
@@ -397,7 +401,7 @@ ways to use this functionality:
     ```go
     client := &http.Client{}
     client.Transport = newrelic.NewRoundTripper(client.Transport)
-    request, _ := http.NewRequest("GET", "http://example.com", nil)
+    request, _ := http.NewRequest("GET", "https://example.com", nil)
     // Put transaction in the request's context:
     request = newrelic.RequestWithTransactionContext(request, txn)
     resp, err := client.Do(request)

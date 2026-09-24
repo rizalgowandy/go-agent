@@ -5,8 +5,10 @@ package newrelic
 
 import (
 	"errors"
+	"go/version"
 	"net/http"
 	"reflect"
+	"runtime"
 	"testing"
 	"time"
 
@@ -567,6 +569,66 @@ func TestNilTransaction(t *testing.T) {
 	}
 }
 
+func TestGetName(t *testing.T) {
+	replyfn := func(reply *internal.ConnectReply) {
+		reply.SetSampleEverything()
+		reply.EntityGUID = "entities-are-guid"
+		reply.TraceIDGenerator = internal.NewTraceIDGenerator(12345)
+	}
+	cfgfn := func(cfg *Config) {
+		cfg.AppName = "app-name"
+		cfg.DistributedTracer.Enabled = true
+	}
+	app := testApp(replyfn, cfgfn, t)
+	txn := app.StartTransaction("hello")
+	defer txn.End()
+	txn.Ignore()
+	txn.SetName("hello世界")
+	if theName := txn.Name(); theName != "hello世界" {
+		t.Error(theName)
+	}
+}
+
+func TestIgnoreTransaction(t *testing.T) {
+	replyfn := func(reply *internal.ConnectReply) {
+		reply.SetSampleEverything()
+		reply.EntityGUID = "entities-are-guid"
+		reply.TraceIDGenerator = internal.NewTraceIDGenerator(12345)
+	}
+	cfgfn := func(cfg *Config) {
+		cfg.AppName = "app-name"
+		cfg.DistributedTracer.Enabled = true
+	}
+	app := testApp(replyfn, cfgfn, t)
+	txn := app.StartTransaction("hello")
+	txn.Ignore()
+	txn.SetName("hello世界")
+	txn.NoticeError(errors.New("hi"))
+	txn.End()
+
+	app.ExpectTxnTraces(t, []internal.WantTxnTrace{})
+}
+
+func TestIgnoreApdex(t *testing.T) {
+	replyfn := func(reply *internal.ConnectReply) {
+		reply.SetSampleEverything()
+		reply.EntityGUID = "entities-are-guid"
+		reply.TraceIDGenerator = internal.NewTraceIDGenerator(12345)
+	}
+	cfgfn := func(cfg *Config) {
+		cfg.AppName = "app-name"
+		cfg.DistributedTracer.Enabled = true
+	}
+	app := testApp(replyfn, cfgfn, t)
+	txn := app.StartTransaction("hello")
+	txn.IgnoreApdex()
+	txn.SetName("hello世界")
+	txn.NoticeError(errors.New("hi"))
+	txn.End()
+
+	app.ExpectTxnTraces(t, []internal.WantTxnTrace{})
+}
+
 func TestEmptyTransaction(t *testing.T) {
 	txn := &Transaction{}
 
@@ -940,4 +1002,73 @@ func TestErrAttrsAddedWhenPanic(t *testing.T) {
 			},
 		},
 	})
+}
+
+func TestPanicNilRecovery(t *testing.T) {
+	cfgFnRecordPanics := func(cfg *Config) {
+		cfg.DistributedTracer.Enabled = true
+		cfg.ErrorCollector.RecordPanics = true
+	}
+	app := testApp(replyFn, cfgFnRecordPanics, t)
+	func() {
+		defer func() {
+			recovered := recover()
+			if recovered == nil {
+				t.Error("code did not panic as expected")
+			} else if _, isNil := recovered.(*runtime.PanicNilError); !isNil {
+				t.Errorf("code did not panic with nil as expected; got %v (type %T) instead", recovered, recovered)
+			}
+		}()
+		txn := app.StartTransaction("hello")
+		defer txn.End()
+		panic(nil)
+	}()
+	errorMessage := "panic called with nil argument"
+	if version.Compare(runtime.Version(), "go1.26.7") > 0 {
+		errorMessage = "runtime error: panic called with nil argument"
+	}
+	app.ExpectSpanEvents(t, []internal.WantEvent{
+		{
+			AgentAttributes: map[string]interface{}{
+				SpanAttributeErrorClass:   "panic",
+				SpanAttributeErrorMessage: errorMessage,
+			},
+			Intrinsics: map[string]interface{}{
+				"category":         internal.MatchAnything,
+				"timestamp":        internal.MatchAnything,
+				"name":             "OtherTransaction/Go/hello",
+				"transaction.name": "OtherTransaction/Go/hello",
+				"nr.entryPoint":    true,
+			},
+		},
+	})
+}
+
+func TestIsEndedInternal(t *testing.T) {
+	tests := []struct {
+		name     string
+		txn      *txn
+		expected bool
+	}{
+		{
+			name:     "finished transaction",
+			txn:      &txn{finished: true},
+			expected: true,
+		},
+		{
+			name:     "unfinished transaction",
+			txn:      &txn{finished: false},
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			thread := &thread{txn: tt.txn}
+			result := thread.IsEnded()
+			if result != tt.expected {
+				t.Errorf("IsEnded() = %v; want %v", result, tt.expected)
+			}
+		})
+	}
 }

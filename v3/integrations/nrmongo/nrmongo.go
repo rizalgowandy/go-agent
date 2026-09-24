@@ -8,8 +8,8 @@
 // options using `SetMonitor`
 // (https://godoc.org/go.mongodb.org/mongo-driver/mongo/options#ClientOptions.SetMonitor):
 //
-//	nrMon := nrmongo.NewCommandMonitor(nil)
-//	client, err := mongo.Connect(ctx, options.Client().SetMonitor(nrMon))
+//	nrCmdMonitor := nrmongo.NewCommandMonitor(nil)
+//	client, err := mongo.Connect(ctx, options.Client().SetMonitor(nrCmdMonitor))
 //
 // Note that it is important that this `nrmongo` monitor is the last monitor
 // set, otherwise it will be overwritten.  If needing to use more than one
@@ -21,22 +21,25 @@
 //		Succeeded: origSucceeded,
 //		Failed:    origFailed,
 //	}
-//	nrMon := nrmongo.NewCommandMonitor(origMon)
-//	client, err := mongo.Connect(ctx, options.Client().SetMonitor(nrMon))
+//	nrCmdMonitor := nrmongo.NewCommandMonitor(origMon)
+//	client, err := mongo.Connect(ctx, options.Client().SetMonitor(nrCmdMonitor))
 //
 // Then add the current transaction to the context used in any MongoDB call:
 //
 //	ctx = newrelic.NewContext(context.Background(), txn)
+//	collection := client.Database("testing").Collection("numbers")
 //	resp, err := collection.InsertOne(ctx, bson.M{"name": "pi", "value": 3.14159})
 package nrmongo
 
 import (
 	"context"
 	"regexp"
+	"strings"
 	"sync"
 
 	"github.com/newrelic/go-agent/v3/internal"
-	newrelic "github.com/newrelic/go-agent/v3/newrelic"
+	"github.com/newrelic/go-agent/v3/newrelic"
+	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/event"
 )
 
@@ -60,21 +63,6 @@ var connIDPattern = regexp.MustCompile(`([^:\[]+)(?::(\d+))?\[-\d+]`)
 // returned `*event.CommandMonitor` creates `newrelic.DatastoreSegment`s
 // (https://godoc.org/github.com/newrelic/go-agent#DatastoreSegment) for each
 // database call.
-//
-//	// Use `SetMonitor` to register the CommandMonitor.
-//	client, err := mongo.Connect(ctx, options.Client().ApplyURI("mongodb://localhost:27017").SetMonitor(nrmongo.NewCommandMonitor(nil)))
-//	if err != nil {
-//		log.Fatal(err)
-//	}
-//
-//	// Add transaction to the context.  This step is required.
-//	ctx = newrelic.NewContext(ctx, txn)
-//
-//	collection := client.Database("testing").Collection("numbers")
-//	resp, err := collection.InsertOne(ctx, bson.M{"name": "pi", "value": 3.14159})
-//	if err != nil {
-//		log.Fatal(err)
-//	}
 func NewCommandMonitor(original *event.CommandMonitor) *event.CommandMonitor {
 	m := mongoMonitor{
 		segmentMap:  make(map[int64]*newrelic.DatastoreSegment),
@@ -88,6 +76,8 @@ func NewCommandMonitor(original *event.CommandMonitor) *event.CommandMonitor {
 }
 
 func (m *mongoMonitor) started(ctx context.Context, e *event.CommandStartedEvent) {
+	var secureAgentEvent any
+
 	if m.origCommMon != nil && m.origCommMon.Started != nil {
 		m.origCommMon.Started(ctx, e)
 	}
@@ -95,6 +85,17 @@ func (m *mongoMonitor) started(ctx context.Context, e *event.CommandStartedEvent
 	if txn == nil {
 		return
 	}
+	if newrelic.IsSecurityAgentPresent() {
+		commandName := e.CommandName
+		if strings.ToLower(commandName) == "findandmodify" {
+			value, ok := e.Command.Lookup("remove").BooleanOK()
+			if ok && value {
+				commandName = "delete"
+			}
+		}
+		secureAgentEvent = newrelic.GetSecurityAgentInterface().SendEvent("MONGO", getJsonQuery(e.Command), commandName)
+	}
+
 	host, port := calcHostAndPort(e.ConnectionID)
 	sgmt := newrelic.DatastoreSegment{
 		StartTime:    txn.StartSegmentNow(),
@@ -104,6 +105,9 @@ func (m *mongoMonitor) started(ctx context.Context, e *event.CommandStartedEvent
 		Host:         host,
 		PortPathOrID: port,
 		DatabaseName: e.DatabaseName,
+	}
+	if newrelic.IsSecurityAgentPresent() {
+		sgmt.SetSecureAgentEvent(secureAgentEvent)
 	}
 	m.addSgmt(e, &sgmt)
 }
@@ -121,6 +125,10 @@ func (m *mongoMonitor) addSgmt(e *event.CommandStartedEvent, sgmt *newrelic.Data
 }
 
 func (m *mongoMonitor) succeeded(ctx context.Context, e *event.CommandSucceededEvent) {
+	if sgmt := m.getSgmt(e.RequestID); sgmt != nil && newrelic.IsSecurityAgentPresent() {
+		newrelic.GetSecurityAgentInterface().SendExitEvent(sgmt.GetSecureAgentEvent(), nil)
+	}
+
 	m.endSgmtIfExists(e.RequestID)
 	if m.origCommMon != nil && m.origCommMon.Succeeded != nil {
 		m.origCommMon.Succeeded(ctx, e)
@@ -147,6 +155,12 @@ func (m *mongoMonitor) getAndRemoveSgmt(id int64) *newrelic.DatastoreSegment {
 	}
 	return sgmt
 }
+func (m *mongoMonitor) getSgmt(id int64) *newrelic.DatastoreSegment {
+	m.Lock()
+	defer m.Unlock()
+	sgmt := m.segmentMap[id]
+	return sgmt
+}
 
 func calcHostAndPort(connID string) (host string, port string) {
 	// FindStringSubmatch either returns nil or an array of the size # of submatches + 1 (in this case 3)
@@ -156,4 +170,13 @@ func calcHostAndPort(connID string) (host string, port string) {
 		port = addressParts[2]
 	}
 	return
+}
+
+func getJsonQuery(q interface{}) []byte {
+	map_json, err := bson.MarshalExtJSON(q, true, true)
+	if err != nil {
+		return []byte("")
+	} else {
+		return map_json
+	}
 }

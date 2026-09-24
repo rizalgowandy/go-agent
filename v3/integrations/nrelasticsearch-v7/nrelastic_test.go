@@ -14,8 +14,8 @@ import (
 	elasticsearch "github.com/elastic/go-elasticsearch/v7"
 	"github.com/elastic/go-elasticsearch/v7/esapi"
 	"github.com/newrelic/go-agent/v3/internal"
-	"github.com/newrelic/go-agent/v3/internal/integrationsupport"
 	newrelic "github.com/newrelic/go-agent/v3/newrelic"
+	"github.com/newrelic/go-agent/v3/newrelic/integrationsupport"
 )
 
 func TestParseRequest(t *testing.T) {
@@ -459,9 +459,8 @@ func TestSearch(t *testing.T) {
 		{Name: "Datastore/allOther"},
 		{Name: "Datastore/Elasticsearch/all"},
 		{Name: "Datastore/Elasticsearch/allOther"},
-		{Name: "Datastore/operation/Elasticsearch/search"},
-		{Name: "Datastore/statement/Elasticsearch/myindex/search"},
-		{Name: "Datastore/statement/Elasticsearch/myindex/search", Scope: "OtherTransaction/Go/txnName"},
+		{Name: "Datastore/operation/Elasticsearch/info"},
+		{Name: "Datastore/operation/Elasticsearch/info", Scope: "OtherTransaction/Go/txnName", Forced: nil, Data: nil},
 	})
 }
 
@@ -500,5 +499,4 @@ func TestInfoRequest(t *testing.T) {
 		{Name: "Datastore/operation/Elasticsearch/info", Scope: "", Forced: nil, Data: nil},
 		{Name: "Datastore/operation/Elasticsearch/info", Scope: "OtherTransaction/Go/txnName", Forced: nil, Data: nil},
 	})
-
 }

@@ -6,6 +6,7 @@ package newrelic
 import (
 	"encoding/json"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/newrelic/go-agent/v3/internal"
@@ -35,6 +36,11 @@ type appRun struct {
 	// flexible harvest periods.  This field is created once at appRun
 	// creation.
 	harvestConfig harvestConfig
+
+	// Error code caches for faster lookups O(1)
+	ignoreErrorCodesCache map[int]bool
+	expectErrorCodesCache map[int]bool
+	mu                    sync.RWMutex
 }
 
 const (
@@ -43,10 +49,12 @@ const (
 
 func newAppRun(config config, reply *internal.ConnectReply) *appRun {
 	run := &appRun{
-		Reply:           reply,
-		AttributeConfig: createAttributeConfig(config, reply.SecurityPolicies.AttributesInclude.Enabled()),
-		Config:          config,
-		rulesCache:      newRulesCache(txnNameCacheLimit),
+		Reply:                 reply,
+		AttributeConfig:       createAttributeConfig(config, reply.SecurityPolicies.AttributesInclude.Enabled()),
+		Config:                config,
+		rulesCache:            newRulesCache(txnNameCacheLimit),
+		ignoreErrorCodesCache: make(map[int]bool),
+		expectErrorCodesCache: make(map[int]bool),
 	}
 
 	// Overwrite local settings with any server-side-config settings
@@ -54,16 +62,28 @@ func newAppRun(config config, reply *internal.ConnectReply) *appRun {
 	// function is a value and not a pointer: We do not want to change the
 	// input Config with values particular to this connection.
 
-	if v := run.Reply.ServerSideConfig.TransactionTracerEnabled; nil != v {
+	if v := run.Reply.ServerSideConfig.TransactionTracerEnabled; v != nil {
 		run.Config.TransactionTracer.Enabled = *v
 	}
-	if v := run.Reply.ServerSideConfig.ErrorCollectorEnabled; nil != v {
+	if v := run.Reply.ServerSideConfig.ErrorCollectorEnabled; v != nil {
 		run.Config.ErrorCollector.Enabled = *v
 	}
-	if v := run.Reply.ServerSideConfig.CrossApplicationTracerEnabled; nil != v {
+	if v := run.Reply.ServerSideConfig.CrossApplicationTracerEnabled; v != nil {
 		run.Config.CrossApplicationTracer.Enabled = *v
 	}
-	if v := run.Reply.ServerSideConfig.TransactionTracerThreshold; nil != v {
+	if v := run.Reply.ServerSideConfig.ProfilingEnabled; v != nil {
+		run.Config.Profiling.Enabled = *v
+	}
+	if v := run.Reply.ServerSideConfig.AIMonitoringEnabled; v != nil {
+		run.Config.AIMonitoring.Enabled = *v
+	}
+	if v := run.Reply.ServerSideConfig.AIMonitoringStreamingEnabled; v != nil {
+		run.Config.AIMonitoring.Streaming.Enabled = *v
+	}
+	if v := run.Reply.ServerSideConfig.AIMonitoringRecordContentEnabled; v != nil {
+		run.Config.AIMonitoring.RecordContent.Enabled = *v
+	}
+	if v := run.Reply.ServerSideConfig.TransactionTracerThreshold; v != nil {
 		switch val := v.(type) {
 		case float64:
 			run.Config.TransactionTracer.Threshold.IsApdexFailing = false
@@ -74,11 +94,29 @@ func newAppRun(config config, reply *internal.ConnectReply) *appRun {
 			}
 		}
 	}
-	if v := run.Reply.ServerSideConfig.TransactionTracerStackTraceThreshold; nil != v {
+	if v := run.Reply.ServerSideConfig.TransactionTracerStackTraceThreshold; v != nil {
 		run.Config.TransactionTracer.Segments.StackTraceThreshold = internal.FloatSecondsToDuration(*v)
 	}
-	if v := run.Reply.ServerSideConfig.ErrorCollectorIgnoreStatusCodes; nil != v {
+	if v := run.Reply.ServerSideConfig.ErrorCollectorIgnoreStatusCodes; v != nil {
 		run.Config.ErrorCollector.IgnoreStatusCodes = v
+	}
+	if run.Config.ErrorCollector.IgnoreStatusCodes != nil {
+		run.mu.Lock()
+		for _, errorCode := range run.Config.ErrorCollector.IgnoreStatusCodes {
+			run.ignoreErrorCodesCache[errorCode] = true
+		}
+		run.mu.Unlock()
+	}
+
+	if v := run.Reply.ServerSideConfig.ErrorCollectorExpectStatusCodes; v != nil {
+		run.Config.ErrorCollector.ExpectStatusCodes = v
+	}
+	if run.Config.ErrorCollector.ExpectStatusCodes != nil {
+		run.mu.Lock()
+		for _, errorCode := range run.Config.ErrorCollector.ExpectStatusCodes {
+			run.expectErrorCodesCache[errorCode] = true
+		}
+		run.mu.Unlock()
 	}
 
 	if !run.Reply.CollectErrorEvents {
@@ -109,7 +147,7 @@ func newAppRun(config config, reply *internal.ConnectReply) *appRun {
 		reply.SamplingTarget,
 		time.Now())
 
-	if "" != run.Reply.RunID {
+	if run.Reply.RunID != "" {
 		js, _ := json.Marshal(settings(run.Config.Config))
 		run.Config.Logger.Debug("final configuration", map[string]interface{}{
 			"config": jsonString(js),
@@ -118,10 +156,11 @@ func newAppRun(config config, reply *internal.ConnectReply) *appRun {
 
 	run.harvestConfig = harvestConfig{
 		ReportPeriods:   run.ReportPeriods(),
-		MaxTxnEvents:    run.MaxTxnEvents(),
-		MaxCustomEvents: run.MaxCustomEvents(),
-		MaxErrorEvents:  run.MaxErrorEvents(),
-		MaxSpanEvents:   run.MaxSpanEvents(),
+		MaxTxnEvents:    run.limit(run.Config.TransactionEvents.MaxSamplesStored, run.ptrTxnEvents),
+		MaxCustomEvents: run.limit(run.Config.CustomInsightsEvents.MaxSamplesStored, run.ptrCustomEvents),
+		MaxErrorEvents:  run.limit(run.Config.ErrorCollector.MaxSamplesStored, run.ptrErrorEvents),
+		MaxSpanEvents:   run.limit(run.Config.SpanEvents.MaxSamplesStored, run.ptrSpanEvents),
+		LoggingConfig:   run.LoggingConfig(),
 	}
 
 	return run
@@ -148,13 +187,13 @@ func newServerlessConnectReply(config config) *internal.ConnectReply {
 	reply.TrustedAccountKey = config.ServerlessMode.TrustedAccountKey
 	reply.PrimaryAppID = config.ServerlessMode.PrimaryAppID
 
-	if "" == reply.TrustedAccountKey {
+	if reply.TrustedAccountKey == "" {
 		// The trust key does not need to be provided by customers whose
 		// account ID is the same as the trust key.
 		reply.TrustedAccountKey = reply.AccountID
 	}
 
-	if "" == reply.PrimaryAppID {
+	if reply.PrimaryAppID == "" {
 		reply.PrimaryAppID = serverlessDefaultPrimaryAppID
 	}
 
@@ -170,12 +209,15 @@ func (run *appRun) responseCodeIsError(code int) bool {
 	if code < 400 && code >= 100 {
 		return false
 	}
-	for _, ignoreCode := range run.Config.ErrorCollector.IgnoreStatusCodes {
-		if code == ignoreCode {
-			return false
-		}
-	}
-	return true
+	run.mu.RLock()
+	defer run.mu.RUnlock()
+	return !run.ignoreErrorCodesCache[code]
+}
+
+func (run *appRun) responseCodeIsExpected(code int) bool {
+	run.mu.RLock()
+	defer run.mu.RUnlock()
+	return run.expectErrorCodesCache[code]
 }
 
 func (run *appRun) txnTraceThreshold(apdexThreshold time.Duration) time.Duration {
@@ -187,23 +229,33 @@ func (run *appRun) txnTraceThreshold(apdexThreshold time.Duration) time.Duration
 
 func (run *appRun) ptrTxnEvents() *uint    { return run.Reply.EventData.Limits.TxnEvents }
 func (run *appRun) ptrCustomEvents() *uint { return run.Reply.EventData.Limits.CustomEvents }
+func (run *appRun) ptrLogEvents() *uint    { return run.Reply.EventData.Limits.LogEvents }
 func (run *appRun) ptrErrorEvents() *uint  { return run.Reply.EventData.Limits.ErrorEvents }
-func (run *appRun) ptrSpanEvents() *uint   { return run.Reply.EventData.Limits.SpanEvents }
+func (run *appRun) ptrSpanEvents() *uint   { return run.Reply.SpanEventHarvestConfig.HarvestLimit }
 
-func (run *appRun) MaxTxnEvents() int { return run.limit(run.Config.maxTxnEvents(), run.ptrTxnEvents) }
-func (run *appRun) MaxCustomEvents() int {
-	return run.limit(internal.MaxCustomEvents, run.ptrCustomEvents)
-}
-func (run *appRun) MaxErrorEvents() int {
-	return run.limit(internal.MaxErrorEvents, run.ptrErrorEvents)
-}
-func (run *appRun) MaxSpanEvents() int { return run.limit(maxSpanEvents, run.ptrSpanEvents) }
+func (run *appRun) LoggingConfig() (config loggingConfig) {
+	logging := run.Config.ApplicationLogging
 
-func (run *appRun) limit(dflt int, field func() *uint) int {
-	if nil != field() {
+	config.loggingEnabled = logging.Enabled
+	config.collectEvents = logging.Enabled && logging.Forwarding.Enabled && !run.Config.HighSecurity
+	config.maxLogEvents = run.limit(logging.Forwarding.MaxSamplesStored, run.ptrLogEvents)
+	config.collectMetrics = logging.Enabled && logging.Metrics.Enabled
+	config.localEnrichment = logging.Enabled && logging.LocalDecorating.Enabled
+	if run.Config.Labels != nil && logging.Forwarding.Enabled && logging.Forwarding.Labels.Enabled {
+		config.includeLabels = run.Config.Labels
+		config.excludeLabels = &logging.Forwarding.Labels.Exclude
+	}
+	if run.Config.CustomInsightsEvents.CustomAttributesValues != nil && logging.Forwarding.Enabled && run.Config.CustomInsightsEvents.CustomAttributesEnabled {
+		config.customAttributes = run.Config.CustomInsightsEvents.CustomAttributesValues
+	}
+	return config
+}
+
+func (run *appRun) limit(configMaxSamplesStored int, field func() *uint) int {
+	if field() != nil {
 		return int(*field())
 	}
-	return dflt
+	return configMaxSamplesStored
 }
 
 func (run *appRun) ReportPeriods() map[harvestTypes]time.Duration {
@@ -213,10 +265,11 @@ func (run *appRun) ReportPeriods() map[harvestTypes]time.Duration {
 	for tp, fn := range map[harvestTypes]func() *uint{
 		harvestTxnEvents:    run.ptrTxnEvents,
 		harvestCustomEvents: run.ptrCustomEvents,
+		harvestLogEvents:    run.ptrLogEvents,
 		harvestErrorEvents:  run.ptrErrorEvents,
 		harvestSpanEvents:   run.ptrSpanEvents,
 	} {
-		if nil != run && fn() != nil {
+		if run != nil && fn() != nil {
 			configurable |= tp
 		} else {
 			fixed |= tp
@@ -229,11 +282,11 @@ func (run *appRun) ReportPeriods() map[harvestTypes]time.Duration {
 }
 
 func (run *appRun) createTransactionName(input string, isWeb bool) string {
-	if name := run.rulesCache.find(input, isWeb); "" != name {
+	if name := run.rulesCache.find(input, isWeb); name != "" {
 		return name
 	}
 	name := internal.CreateFullTxnName(input, run.Reply, isWeb)
-	if "" != name {
+	if name != "" {
 		// Note that we  don't cache situations where the rules say
 		// ignore.  It would increase complication (we would need to
 		// disambiguate not-found vs ignore).  Also, the ignore code

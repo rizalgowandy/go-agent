@@ -5,7 +5,6 @@
 //
 // This package improves the class and stack-trace fields of pkg/error errors
 // when they are recorded with Transaction.NoticeError.
-//
 package nrpkgerrors
 
 import (
@@ -76,13 +75,34 @@ func errorClass(e error) string {
 	return fmt.Sprintf("%T", cause)
 }
 
+var (
+	errNilError = errors.New("nil")
+)
+
 // Wrap wraps a pkg/errors error so that when noticed by
 // newrelic.Transaction.NoticeError it gives an improved stacktrace and class
 // type.
 func Wrap(e error) error {
+	if e == nil {
+		return newrelic.Error{
+			Message: errNilError.Error(),
+			Class:   errorClass(errNilError),
+			Stack:   stackTrace(errNilError),
+		}
+	}
+
+	attributes := make(map[string]interface{})
+	switch error := e.(type) {
+	case newrelic.Error:
+		// if e is type newrelic.Error, copy attributes into wrapped error
+		for key, value := range error.ErrorAttributes() {
+			attributes[key] = value
+		}
+	}
 	return newrelic.Error{
-		Message: e.Error(),
-		Class:   errorClass(e),
-		Stack:   stackTrace(e),
+		Message:    e.Error(),
+		Class:      errorClass(e),
+		Stack:      stackTrace(e),
+		Attributes: attributes,
 	}
 }

@@ -12,8 +12,8 @@ import (
 	stan "github.com/nats-io/stan.go"
 	"github.com/newrelic/go-agent/v3/integrations/nrstan"
 	"github.com/newrelic/go-agent/v3/internal"
-	"github.com/newrelic/go-agent/v3/internal/integrationsupport"
 	newrelic "github.com/newrelic/go-agent/v3/newrelic"
+	"github.com/newrelic/go-agent/v3/newrelic/integrationsupport"
 )
 
 const (
@@ -31,7 +31,7 @@ func TestMain(m *testing.M) {
 }
 
 func createTestApp() integrationsupport.ExpectApp {
-	return integrationsupport.NewTestApp(integrationsupport.SampleEverythingReplyFn, integrationsupport.ConfigFullTraces, cfgFn)
+	return integrationsupport.NewTestApp(integrationsupport.SampleEverythingReplyFn, integrationsupport.ConfigFullTraces, cfgFn, newrelic.ConfigCodeLevelMetricsEnabled(false))
 }
 
 var cfgFn = func(cfg *newrelic.Config) {

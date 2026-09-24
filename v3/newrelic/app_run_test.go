@@ -42,14 +42,48 @@ func TestResponseCodeIsError(t *testing.T) {
 				tc.Code, tc.IsError, is)
 		}
 	}
+}
 
+func TestResponseCodeIsExpected(t *testing.T) {
+	cfg := config{Config: defaultConfig()}
+	cfg.ErrorCollector.ExpectStatusCodes = []int{400, 503, 504}
+	run := newAppRun(cfg, internal.ConnectReplyDefaults())
+
+	for _, tc := range []struct {
+		Code    int
+		IsError bool
+	}{
+		{Code: 0, IsError: false}, // gRPC
+		{Code: 1, IsError: false}, // gRPC
+		{Code: 400, IsError: true},
+		{Code: 404, IsError: false},
+		{Code: 503, IsError: true},
+		{Code: 504, IsError: true},
+	} {
+		if is := run.responseCodeIsExpected(tc.Code); is != tc.IsError {
+			t.Errorf("responseCodeIsError for %d, wanted=%v got=%v",
+				tc.Code, tc.IsError, is)
+		}
+	}
+}
+
+func BenchmarkResponseCodeIsExpectedHit(b *testing.B) {
+	cfg := config{Config: defaultConfig()}
+	cfg.ErrorCollector.ExpectStatusCodes = []int{400, 503, 504}
+	run := newAppRun(cfg, internal.ConnectReplyDefaults())
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for n := 0; n < b.N; n++ {
+		run.responseCodeIsExpected(400)
+	}
 }
 
 func TestCrossAppTracingEnabled(t *testing.T) {
-	// CAT should be enabled by default.
+	// CAT should NOT be enabled by default.
 	cfg := config{Config: defaultConfig()}
 	run := newAppRun(cfg, internal.ConnectReplyDefaults())
-	if enabled := run.Config.CrossApplicationTracer.Enabled; !enabled {
+	if enabled := run.Config.CrossApplicationTracer.Enabled; enabled {
 		t.Error(enabled)
 	}
 
@@ -123,13 +157,111 @@ func TestTxnTraceThreshold(t *testing.T) {
 	}
 }
 
+func TestServerSideConfigAIMonitoringEnabled(t *testing.T) {
+	// Server-side config enables a locally disabled setting.
+	cfg := config{Config: defaultConfig()}
+	cfg.AIMonitoring.Enabled = false
+	reply := internal.ConnectReplyDefaults()
+	json.Unmarshal([]byte(`{"agent_config":{"ai_monitoring.enabled":true}}`), &reply)
+	run := newAppRun(cfg, reply)
+	if !run.Config.AIMonitoring.Enabled {
+		t.Error("AIMonitoring.Enabled not enabled by server-side config")
+	}
+
+	// Server-side config disables a locally enabled setting.
+	cfg = config{Config: defaultConfig()}
+	cfg.AIMonitoring.Enabled = true
+	reply = internal.ConnectReplyDefaults()
+	json.Unmarshal([]byte(`{"agent_config":{"ai_monitoring.enabled":false}}`), &reply)
+	run = newAppRun(cfg, reply)
+	if run.Config.AIMonitoring.Enabled {
+		t.Error("AIMonitoring.Enabled not disabled by server-side config")
+	}
+
+	// Absent server-side config leaves the local setting untouched.
+	cfg = config{Config: defaultConfig()}
+	cfg.AIMonitoring.Enabled = true
+	reply = internal.ConnectReplyDefaults()
+	json.Unmarshal([]byte(`{"agent_config":{}}`), &reply)
+	run = newAppRun(cfg, reply)
+	if !run.Config.AIMonitoring.Enabled {
+		t.Error("AIMonitoring.Enabled changed despite absent server-side config")
+	}
+}
+
+func TestServerSideConfigAIMonitoringStreamingEnabled(t *testing.T) {
+	// Server-side config enables a locally disabled setting.
+	cfg := config{Config: defaultConfig()}
+	cfg.AIMonitoring.Streaming.Enabled = false
+	reply := internal.ConnectReplyDefaults()
+	json.Unmarshal([]byte(`{"agent_config":{"ai_monitoring.streaming.enabled":true}}`), &reply)
+	run := newAppRun(cfg, reply)
+	if !run.Config.AIMonitoring.Streaming.Enabled {
+		t.Error("AIMonitoring.Streaming.Enabled not enabled by server-side config")
+	}
+
+	// Server-side config disables a locally enabled setting.
+	cfg = config{Config: defaultConfig()}
+	cfg.AIMonitoring.Streaming.Enabled = true
+	reply = internal.ConnectReplyDefaults()
+	json.Unmarshal([]byte(`{"agent_config":{"ai_monitoring.streaming.enabled":false}}`), &reply)
+	run = newAppRun(cfg, reply)
+	if run.Config.AIMonitoring.Streaming.Enabled {
+		t.Error("AIMonitoring.Streaming.Enabled not disabled by server-side config")
+	}
+
+	// Absent server-side config leaves the local setting untouched.
+	cfg = config{Config: defaultConfig()}
+	cfg.AIMonitoring.Streaming.Enabled = true
+	reply = internal.ConnectReplyDefaults()
+	json.Unmarshal([]byte(`{"agent_config":{}}`), &reply)
+	run = newAppRun(cfg, reply)
+	if !run.Config.AIMonitoring.Streaming.Enabled {
+		t.Error("AIMonitoring.Streaming.Enabled changed despite absent server-side config")
+	}
+}
+
+func TestServerSideConfigAIMonitoringRecordContentEnabled(t *testing.T) {
+	// Server-side config enables a locally disabled setting.
+	cfg := config{Config: defaultConfig()}
+	cfg.AIMonitoring.RecordContent.Enabled = false
+	reply := internal.ConnectReplyDefaults()
+	json.Unmarshal([]byte(`{"agent_config":{"ai_monitoring.record_content.enabled":true}}`), &reply)
+	run := newAppRun(cfg, reply)
+	if !run.Config.AIMonitoring.RecordContent.Enabled {
+		t.Error("AIMonitoring.RecordContent.Enabled not enabled by server-side config")
+	}
+
+	// Server-side config disables a locally enabled setting.
+	cfg = config{Config: defaultConfig()}
+	cfg.AIMonitoring.RecordContent.Enabled = true
+	reply = internal.ConnectReplyDefaults()
+	json.Unmarshal([]byte(`{"agent_config":{"ai_monitoring.record_content.enabled":false}}`), &reply)
+	run = newAppRun(cfg, reply)
+	if run.Config.AIMonitoring.RecordContent.Enabled {
+		t.Error("AIMonitoring.RecordContent.Enabled not disabled by server-side config")
+	}
+
+	// Absent server-side config leaves the local setting untouched.
+	cfg = config{Config: defaultConfig()}
+	cfg.AIMonitoring.RecordContent.Enabled = true
+	reply = internal.ConnectReplyDefaults()
+	json.Unmarshal([]byte(`{"agent_config":{}}`), &reply)
+	run = newAppRun(cfg, reply)
+	if !run.Config.AIMonitoring.RecordContent.Enabled {
+		t.Error("AIMonitoring.RecordContent.Enabled changed despite absent server-side config")
+	}
+}
+
 func TestEmptyReplyEventHarvestDefaults(t *testing.T) {
 	run := newAppRun(config{Config: defaultConfig()}, &internal.ConnectReply{})
 	assertHarvestConfig(t, run.harvestConfig, expectHarvestConfig{
 		maxTxnEvents:    internal.MaxTxnEvents,
 		maxCustomEvents: internal.MaxCustomEvents,
 		maxErrorEvents:  internal.MaxErrorEvents,
-		maxSpanEvents:   maxSpanEvents,
+		maxSpanEvents:   run.Config.DistributedTracer.ReservoirLimit,
+		maxLogEvents:    internal.MaxLogEvents,
+
 		periods: map[harvestTypes]time.Duration{
 			harvestTypesAll: 60 * time.Second,
 			0:               60 * time.Second,
@@ -144,9 +276,13 @@ func TestEventHarvestFieldsAllPopulated(t *testing.T) {
 				"harvest_limits": {
 					"analytic_event_data": 1,
 					"custom_event_data": 2,
-					"span_event_data": 3,
+					"log_event_data": 3,
 					"error_event_data": 4
 				}
+			},
+			"span_event_harvest_config":{
+				"report_period_ms": 10000,
+				"harvest_limit": 5
 			}
 		}}`), internal.PreconnectReply{})
 	if nil != err {
@@ -156,8 +292,9 @@ func TestEventHarvestFieldsAllPopulated(t *testing.T) {
 	assertHarvestConfig(t, run.harvestConfig, expectHarvestConfig{
 		maxTxnEvents:    1,
 		maxCustomEvents: 2,
+		maxLogEvents:    3,
 		maxErrorEvents:  4,
-		maxSpanEvents:   3,
+		maxSpanEvents:   5,
 		periods: map[harvestTypes]time.Duration{
 			harvestMetricsTraces: 60 * time.Second,
 			harvestTypesEvents:   5 * time.Second,
@@ -178,8 +315,9 @@ func TestZeroReportPeriod(t *testing.T) {
 	assertHarvestConfig(t, run.harvestConfig, expectHarvestConfig{
 		maxTxnEvents:    internal.MaxTxnEvents,
 		maxCustomEvents: internal.MaxCustomEvents,
+		maxLogEvents:    internal.MaxLogEvents,
 		maxErrorEvents:  internal.MaxErrorEvents,
-		maxSpanEvents:   maxSpanEvents,
+		maxSpanEvents:   internal.MaxSpanEvents,
 		periods: map[harvestTypes]time.Duration{
 			harvestTypesAll: 60 * time.Second,
 			0:               60 * time.Second,
@@ -187,11 +325,11 @@ func TestZeroReportPeriod(t *testing.T) {
 	})
 }
 
-func TestEventHarvestFieldsOnlySpanEvents(t *testing.T) {
+func TestConnectResponseOnlySpanEvents(t *testing.T) {
 	reply, err := internal.UnmarshalConnectReply([]byte(`{"return_value":{
-			"event_harvest_config": {
-				"report_period_ms": 5000,
-				"harvest_limits": { "span_event_data": 3 }
+			"span_event_harvest_config":{
+				"report_period_ms": 10000,
+				"harvest_limit": 3
 			}}}`), internal.PreconnectReply{})
 	if nil != err {
 		t.Fatal(err)
@@ -200,11 +338,12 @@ func TestEventHarvestFieldsOnlySpanEvents(t *testing.T) {
 	assertHarvestConfig(t, run.harvestConfig, expectHarvestConfig{
 		maxTxnEvents:    internal.MaxTxnEvents,
 		maxCustomEvents: internal.MaxCustomEvents,
+		maxLogEvents:    internal.MaxLogEvents,
 		maxErrorEvents:  internal.MaxErrorEvents,
 		maxSpanEvents:   3,
 		periods: map[harvestTypes]time.Duration{
 			harvestTypesAll ^ harvestSpanEvents: 60 * time.Second,
-			harvestSpanEvents:                   5 * time.Second,
+			2:                                   60 * time.Second,
 		},
 	})
 }
@@ -223,7 +362,8 @@ func TestEventHarvestFieldsOnlyTxnEvents(t *testing.T) {
 		maxTxnEvents:    3,
 		maxCustomEvents: internal.MaxCustomEvents,
 		maxErrorEvents:  internal.MaxErrorEvents,
-		maxSpanEvents:   maxSpanEvents,
+		maxSpanEvents:   run.Config.DistributedTracer.ReservoirLimit,
+		maxLogEvents:    internal.MaxLogEvents,
 		periods: map[harvestTypes]time.Duration{
 			harvestTypesAll ^ harvestTxnEvents: 60 * time.Second,
 			harvestTxnEvents:                   5 * time.Second,
@@ -244,8 +384,9 @@ func TestEventHarvestFieldsOnlyErrorEvents(t *testing.T) {
 	assertHarvestConfig(t, run.harvestConfig, expectHarvestConfig{
 		maxTxnEvents:    internal.MaxTxnEvents,
 		maxCustomEvents: internal.MaxCustomEvents,
+		maxLogEvents:    internal.MaxLogEvents,
 		maxErrorEvents:  3,
-		maxSpanEvents:   maxSpanEvents,
+		maxSpanEvents:   run.Config.DistributedTracer.ReservoirLimit,
 		periods: map[harvestTypes]time.Duration{
 			harvestTypesAll ^ harvestErrorEvents: 60 * time.Second,
 			harvestErrorEvents:                   5 * time.Second,
@@ -266,15 +407,15 @@ func TestEventHarvestFieldsOnlyCustomEvents(t *testing.T) {
 	assertHarvestConfig(t, run.harvestConfig, expectHarvestConfig{
 		maxTxnEvents:    internal.MaxTxnEvents,
 		maxCustomEvents: 3,
+		maxLogEvents:    internal.MaxLogEvents,
 		maxErrorEvents:  internal.MaxErrorEvents,
-		maxSpanEvents:   maxSpanEvents,
+		maxSpanEvents:   run.Config.DistributedTracer.ReservoirLimit,
 		periods: map[harvestTypes]time.Duration{
 			harvestTypesAll ^ harvestCustomEvents: 60 * time.Second,
 			harvestCustomEvents:                   5 * time.Second,
 		},
 	})
 }
-
 func TestConfigurableHarvestNegativeReportPeriod(t *testing.T) {
 	h, err := internal.UnmarshalConnectReply([]byte(`{"return_value":{
 			"event_harvest_config": {
@@ -318,9 +459,32 @@ func TestConfigurableTxnEvents_withCollResponse(t *testing.T) {
 	if nil != err {
 		t.Fatal(err)
 	}
-	result := newAppRun(config{Config: defaultConfig()}, h).MaxTxnEvents()
-	if result != 15 {
-		t.Error(fmt.Sprintf("Unexpected max number of txn events, expected %d but got %d", 15, result))
+	run := newAppRun(config{Config: defaultConfig()}, h)
+	// changed this line because I believe we are not changing the local config based on the response but just the harvest config
+	if run.harvestConfig.MaxTxnEvents != 15 {
+		t.Errorf("Unexpected max number of txn events, expected %d but got %d", 15, run.harvestConfig.MaxTxnEvents)
+	}
+}
+
+func TestConfigurableTxnEvents_configMoreThanMax(t *testing.T) {
+	h, err := internal.UnmarshalConnectReply([]byte(
+		`{"return_value":{
+			"event_harvest_config": {
+				"report_period_ms": 10000
+			}
+        }}`), internal.PreconnectReply{})
+	if nil != err {
+		t.Fatal(err)
+	}
+	cfg := config{Config: defaultConfig()}
+	// Original
+	// cfg.TransactionEvents.MaxSamplesStored = internal.MaxTxnEvents + 100
+	// through code (almost like a setter)
+	cfg.TransactionEvents.MaxSamplesStored = maxTxnEvents(internal.MaxTxnEvents + 100)
+
+	run := newAppRun(cfg, h)
+	if run.harvestConfig.MaxTxnEvents != internal.MaxTxnEvents {
+		t.Errorf("Unexpected max number of txn events, expected %d but got %d", internal.MaxTxnEvents, run.harvestConfig.MaxTxnEvents)
 	}
 }
 
@@ -337,27 +501,9 @@ func TestConfigurableTxnEvents_notInCollResponse(t *testing.T) {
 	expected := 10
 	cfg := config{Config: defaultConfig()}
 	cfg.TransactionEvents.MaxSamplesStored = expected
-	result := newAppRun(cfg, reply).MaxTxnEvents()
-	if result != expected {
-		t.Error(fmt.Sprintf("Unexpected max number of txn events, expected %d but got %d", expected, result))
-	}
-}
-
-func TestConfigurableTxnEvents_configMoreThanMax(t *testing.T) {
-	h, err := internal.UnmarshalConnectReply([]byte(
-		`{"return_value":{
-			"event_harvest_config": {
-				"report_period_ms": 10000
-			}
-        }}`), internal.PreconnectReply{})
-	if nil != err {
-		t.Fatal(err)
-	}
-	cfg := config{Config: defaultConfig()}
-	cfg.TransactionEvents.MaxSamplesStored = internal.MaxTxnEvents + 100
-	result := newAppRun(cfg, h).MaxTxnEvents()
-	if result != internal.MaxTxnEvents {
-		t.Error(fmt.Sprintf("Unexpected max number of txn events, expected %d but got %d", internal.MaxTxnEvents, result))
+	run := newAppRun(cfg, reply)
+	if run.Config.TransactionEvents.MaxSamplesStored != expected {
+		t.Errorf("Unexpected max number of txn events, expected %d but got %d", expected, run.Config.TransactionEvents.MaxSamplesStored)
 	}
 }
 
@@ -366,9 +512,13 @@ type expectHarvestConfig struct {
 	maxCustomEvents int
 	maxErrorEvents  int
 	maxSpanEvents   int
+	maxLogEvents    int
 	periods         map[harvestTypes]time.Duration
 }
 
+func errorExpectNotEqualActual(value string, actual, expect interface{}) error {
+	return fmt.Errorf("Expected %s value does not match actual; actual: %+v expect: %+v", value, actual, expect)
+}
 func assertHarvestConfig(t testing.TB, hc harvestConfig, expect expectHarvestConfig) {
 	if h, ok := t.(interface {
 		Helper()
@@ -376,19 +526,22 @@ func assertHarvestConfig(t testing.TB, hc harvestConfig, expect expectHarvestCon
 		h.Helper()
 	}
 	if max := hc.MaxTxnEvents; max != expect.maxTxnEvents {
-		t.Error(max, expect.maxTxnEvents)
+		t.Error(errorExpectNotEqualActual("maxTxnEvents", max, expect.maxTxnEvents))
 	}
 	if max := hc.MaxCustomEvents; max != expect.maxCustomEvents {
-		t.Error(max, expect.maxCustomEvents)
+		t.Error(errorExpectNotEqualActual("MaxCustomEvents", max, expect.maxCustomEvents))
 	}
 	if max := hc.MaxSpanEvents; max != expect.maxSpanEvents {
-		t.Error(max, expect.maxSpanEvents)
+		t.Error(errorExpectNotEqualActual("MaxSpanEvents", max, expect.maxSpanEvents))
 	}
 	if max := hc.MaxErrorEvents; max != expect.maxErrorEvents {
-		t.Error(max, expect.maxErrorEvents)
+		t.Error(errorExpectNotEqualActual("MaxErrorEvents", max, expect.maxErrorEvents))
+	}
+	if max := hc.LoggingConfig.maxLogEvents; max != expect.maxLogEvents {
+		t.Error(errorExpectNotEqualActual("MaxLogEvents", max, expect.maxErrorEvents))
 	}
 	if periods := hc.ReportPeriods; !reflect.DeepEqual(periods, expect.periods) {
-		t.Error(periods, expect.periods)
+		t.Error(errorExpectNotEqualActual("ReportPeriods", periods, expect.periods))
 	}
 }
 
@@ -445,5 +598,245 @@ func TestCreateTransactionName(t *testing.T) {
 	// Check that the next call returns the same output.
 	if out := run.createTransactionName("/zap/zip/zep", true); out != want {
 		t.Error("wanted:", want, "got:", out)
+	}
+}
+
+func testMockConnectReply(t *testing.T, retVal string) *internal.ConnectReply {
+	h, err := internal.UnmarshalConnectReply([]byte(retVal), internal.PreconnectReply{})
+	if nil != err {
+		t.Fatal(err)
+	}
+	return h
+}
+
+func uintPtr(v uint) *uint {
+	return &v
+}
+
+func Test_appRun_limit(t *testing.T) {
+	tests := []struct {
+		name                   string
+		configMaxSamplesStored int
+		fieldValue             *uint // nil means field() returns nil
+		want                   int
+	}{
+		{
+			name:                   "field returns nil, use config value",
+			configMaxSamplesStored: 1000,
+			fieldValue:             nil,
+			want:                   1000,
+		},
+		{
+			name:                   "field returns value, use field value",
+			configMaxSamplesStored: 1000,
+			fieldValue:             uintPtr(500),
+			want:                   500,
+		},
+		{
+			name:                   "field returns zero, use field value",
+			configMaxSamplesStored: 1000,
+			fieldValue:             uintPtr(0),
+			want:                   0,
+		},
+		{
+			name:                   "config is zero, field returns nil",
+			configMaxSamplesStored: 0,
+			fieldValue:             nil,
+			want:                   0,
+		},
+		{
+			name:                   "config is zero, field returns value",
+			configMaxSamplesStored: 0,
+			fieldValue:             uintPtr(100),
+			want:                   100,
+		},
+		{
+			name:                   "config is negative, field returns nil", // keeping this test so we know whatever value exists, we will use
+			configMaxSamplesStored: -1,
+			fieldValue:             nil,
+			want:                   -1,
+		},
+		{
+			name:                   "config is negative, field returns value",
+			configMaxSamplesStored: -1,
+			fieldValue:             uintPtr(200),
+			want:                   200,
+		},
+		{
+			name:                   "field returns large value",
+			configMaxSamplesStored: 1000,
+			fieldValue:             uintPtr(999999),
+			want:                   999999,
+		},
+		{
+			name:                   "field returns 1",
+			configMaxSamplesStored: 1000,
+			fieldValue:             uintPtr(1),
+			want:                   1,
+		},
+		{
+			name:                   "config and field both large values",
+			configMaxSamplesStored: 50000,
+			fieldValue:             uintPtr(60000),
+			want:                   60000,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			run := &appRun{}
+
+			// Create a field function that returns the test value
+			fieldFunc := func() *uint {
+				return tt.fieldValue
+			}
+
+			got := run.limit(tt.configMaxSamplesStored, fieldFunc)
+			if got != tt.want {
+				t.Errorf("limit() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// Since we are using uint we are expecting a non-negative number in the harvester response.
+// If there were to be a negative number in the test case, it would cause an error when
+// unmarshaling the json response.  This test in only testing how the response is handled
+// it does not matter what the limits are in this case
+func Test_appRun_ptrEventsMethods(t *testing.T) {
+	type eventTypeTest struct {
+		name       string
+		methodName string
+		method     func(*appRun) *uint
+		jsonKey    string
+		configKey  string
+	}
+
+	eventTypes := []eventTypeTest{
+		{
+			name:       "TxnEvents",
+			methodName: "ptrTxnEvents",
+			method:     (*appRun).ptrTxnEvents,
+			jsonKey:    "event_harvest_config",
+			configKey:  `{"analytic_event_data": %s}`,
+		},
+		{
+			name:       "CustomEvents",
+			methodName: "ptrCustomEvents",
+			method:     (*appRun).ptrCustomEvents,
+			jsonKey:    "event_harvest_config",
+			configKey:  `{"custom_event_data": %s}`,
+		},
+		{
+			name:       "LogEvents",
+			methodName: "ptrLogEvents",
+			method:     (*appRun).ptrLogEvents,
+			jsonKey:    "event_harvest_config",
+			configKey:  `{"log_event_data": %s}`,
+		},
+		{
+			name:       "ErrorEvents",
+			methodName: "ptrErrorEvents",
+			method:     (*appRun).ptrErrorEvents,
+			jsonKey:    "event_harvest_config",
+			configKey:  `{"error_event_data": %s}`,
+		},
+		{
+			name:       "SpanEvents",
+			methodName: "ptrSpanEvents",
+			method:     (*appRun).ptrSpanEvents,
+			jsonKey:    "span_event_harvest_config",
+			configKey:  `%s`,
+		},
+	}
+
+	testCases := []struct {
+		name          string
+		format        string
+		harvest_limit string
+		want          *uint
+	}{
+		{
+			name:          "limit is set to 2000",
+			format:        `{"return_value": {"%s": {"%s": %s}}}`,
+			harvest_limit: "2000",
+			want:          uintPtr(2000),
+		},
+		{
+			name:          "limit is set to 0",
+			format:        `{"return_value": {"%s": {"%s": %s}}}`,
+			harvest_limit: "0",
+			want:          uintPtr(0),
+		},
+		{
+			name:          "limit is set to 1",
+			format:        `{"return_value": {"%s": {"%s": %s}}}`,
+			harvest_limit: "1",
+			want:          uintPtr(1),
+		},
+		{
+			name:          "limit is set to large value",
+			format:        `{"return_value": {"%s": {"%s": %s}}}`,
+			harvest_limit: "999999",
+			want:          uintPtr(999999),
+		},
+		{
+			name:          "config section is null",
+			format:        `{"return_value": {"%s": {"%s": null}}}`,
+			harvest_limit: "null",
+			want:          nil,
+		},
+		{
+			name:          "limit field is null",
+			format:        `{"return_value": {"%s": {"%s": %s}}}`,
+			harvest_limit: "null",
+			want:          nil,
+		},
+		{
+			name:          "config section is missing",
+			format:        `{"return_value": {}}`,
+			harvest_limit: "null",
+			want:          nil,
+		},
+	}
+
+	for _, eventType := range eventTypes {
+		t.Run(eventType.name, func(t *testing.T) {
+			harvestLimitField := "harvest_limits"
+			if eventType.name == "SpanEvents" {
+				harvestLimitField = "harvest_limit"
+			}
+			for _, tt := range testCases {
+				t.Run(tt.name, func(t *testing.T) {
+					var jsonStr string
+
+					switch tt.name {
+					case "config section is missing":
+						jsonStr = tt.format
+					case "config section is null":
+						jsonStr = fmt.Sprintf(tt.format, harvestLimitField, eventType.jsonKey)
+					default:
+						harvestLimit := fmt.Sprintf(eventType.configKey, tt.harvest_limit)
+						jsonStr = fmt.Sprintf(tt.format, eventType.jsonKey, harvestLimitField, harvestLimit)
+					}
+
+					reply := testMockConnectReply(t, jsonStr)
+					run := &appRun{Reply: reply}
+					got := eventType.method(run)
+
+					if tt.want == nil {
+						if got != nil {
+							t.Errorf("%s() = %v, want nil", eventType.methodName, got)
+						}
+					} else {
+						if got == nil {
+							t.Errorf("%s() = nil, want %v", eventType.methodName, *tt.want)
+						} else if *got != *tt.want {
+							t.Errorf("%s() = %v, want %v", eventType.methodName, *got, *tt.want)
+						}
+					}
+				})
+			}
+		})
 	}
 }

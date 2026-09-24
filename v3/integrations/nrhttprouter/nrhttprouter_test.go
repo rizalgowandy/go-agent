@@ -11,8 +11,8 @@ import (
 
 	"github.com/julienschmidt/httprouter"
 	"github.com/newrelic/go-agent/v3/internal"
-	"github.com/newrelic/go-agent/v3/internal/integrationsupport"
 	newrelic "github.com/newrelic/go-agent/v3/newrelic"
+	"github.com/newrelic/go-agent/v3/newrelic/integrationsupport"
 )
 
 func TestMethodFunctions(t *testing.T) {
@@ -31,7 +31,7 @@ func TestMethodFunctions(t *testing.T) {
 	}
 
 	for _, md := range methodFuncs {
-		app := integrationsupport.NewBasicTestApp()
+		app := integrationsupport.NewTestApp(nil, newrelic.ConfigCodeLevelMetricsEnabled(false))
 		router := New(app.Application)
 		md.Fn(router)("/hello/:name", func(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 			// Test that the Transaction is used as the response writer.
@@ -48,9 +48,11 @@ func TestMethodFunctions(t *testing.T) {
 			t.Error("wrong response body", respBody)
 		}
 		app.ExpectTxnMetrics(t, internal.WantTxn{
-			Name:      md.Method + " /hello/:name",
-			IsWeb:     true,
-			NumErrors: 1,
+			Name:          md.Method + " /hello/:name",
+			IsWeb:         true,
+			NumErrors:     1,
+			UnknownCaller: true,
+			ErrorByCaller: true,
 		})
 	}
 }
@@ -73,7 +75,7 @@ func TestGetNoApplication(t *testing.T) {
 }
 
 func TestHandle(t *testing.T) {
-	app := integrationsupport.NewBasicTestApp()
+	app := integrationsupport.NewTestApp(nil, newrelic.ConfigCodeLevelMetricsEnabled(false))
 	router := New(app.Application)
 
 	router.Handle("GET", "/hello/:name", func(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
@@ -93,15 +95,22 @@ func TestHandle(t *testing.T) {
 		t.Error("wrong response body", respBody)
 	}
 	app.ExpectTxnMetrics(t, internal.WantTxn{
-		Name:      "GET /hello/:name",
-		IsWeb:     true,
-		NumErrors: 1,
+		Name:          "GET /hello/:name",
+		IsWeb:         true,
+		NumErrors:     1,
+		UnknownCaller: true,
+		ErrorByCaller: true,
 	})
 	app.ExpectTxnEvents(t, []internal.WantEvent{
 		{
 			Intrinsics: map[string]interface{}{
 				"name":             "WebTransaction/Go/GET /hello/:name",
 				"nr.apdexPerfZone": internal.MatchAnything,
+				"sampled":          false,
+				// Note: "*" is a wildcard value
+				"guid":     "*",
+				"traceId":  "*",
+				"priority": "*",
 			},
 			UserAttributes: map[string]interface{}{
 				"color": "purple",
@@ -117,7 +126,7 @@ func TestHandle(t *testing.T) {
 }
 
 func TestHandler(t *testing.T) {
-	app := integrationsupport.NewBasicTestApp()
+	app := integrationsupport.NewTestApp(nil, newrelic.ConfigCodeLevelMetricsEnabled(false))
 	router := New(app.Application)
 
 	router.Handler("GET", "/hello/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -137,15 +146,22 @@ func TestHandler(t *testing.T) {
 		t.Error("wrong response body", respBody)
 	}
 	app.ExpectTxnMetrics(t, internal.WantTxn{
-		Name:      "GET /hello/",
-		IsWeb:     true,
-		NumErrors: 1,
+		Name:          "GET /hello/",
+		IsWeb:         true,
+		NumErrors:     1,
+		UnknownCaller: true,
+		ErrorByCaller: true,
 	})
 	app.ExpectTxnEvents(t, []internal.WantEvent{
 		{
 			Intrinsics: map[string]interface{}{
 				"name":             "WebTransaction/Go/GET /hello/",
 				"nr.apdexPerfZone": internal.MatchAnything,
+				"sampled":          false,
+				// Note: "*" is a wildcard value
+				"guid":     "*",
+				"traceId":  "*",
+				"priority": "*",
 			},
 			UserAttributes: map[string]interface{}{
 				"color": "purple",
@@ -179,7 +195,7 @@ func TestHandlerMissingApplication(t *testing.T) {
 }
 
 func TestHandlerFunc(t *testing.T) {
-	app := integrationsupport.NewBasicTestApp()
+	app := integrationsupport.NewTestApp(nil, newrelic.ConfigCodeLevelMetricsEnabled(false))
 	router := New(app.Application)
 
 	router.HandlerFunc("GET", "/hello/", func(w http.ResponseWriter, r *http.Request) {
@@ -197,14 +213,16 @@ func TestHandlerFunc(t *testing.T) {
 		t.Error("wrong response body", respBody)
 	}
 	app.ExpectTxnMetrics(t, internal.WantTxn{
-		Name:      "GET /hello/",
-		IsWeb:     true,
-		NumErrors: 1,
+		Name:          "GET /hello/",
+		IsWeb:         true,
+		NumErrors:     1,
+		UnknownCaller: true,
+		ErrorByCaller: true,
 	})
 }
 
 func TestNotFound(t *testing.T) {
-	app := integrationsupport.NewBasicTestApp()
+	app := integrationsupport.NewTestApp(nil, newrelic.ConfigCodeLevelMetricsEnabled(false))
 	router := New(app.Application)
 
 	router.NotFound = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -224,15 +242,22 @@ func TestNotFound(t *testing.T) {
 		t.Error("wrong response body", respBody)
 	}
 	app.ExpectTxnMetrics(t, internal.WantTxn{
-		Name:      "NotFound",
-		IsWeb:     true,
-		NumErrors: 1,
+		Name:          "NotFound",
+		IsWeb:         true,
+		NumErrors:     1,
+		UnknownCaller: true,
+		ErrorByCaller: true,
 	})
 	app.ExpectTxnEvents(t, []internal.WantEvent{
 		{
 			Intrinsics: map[string]interface{}{
 				"name":             "WebTransaction/Go/NotFound",
 				"nr.apdexPerfZone": internal.MatchAnything,
+				"sampled":          false,
+				// Note: "*" is a wildcard value
+				"guid":     "*",
+				"traceId":  "*",
+				"priority": "*",
 			},
 			UserAttributes: map[string]interface{}{
 				"color": "purple",
@@ -267,7 +292,7 @@ func TestNotFoundMissingApplication(t *testing.T) {
 }
 
 func TestNotFoundNotSet(t *testing.T) {
-	app := integrationsupport.NewBasicTestApp()
+	app := integrationsupport.NewTestApp(nil, newrelic.ConfigCodeLevelMetricsEnabled(false))
 	router := New(app.Application)
 
 	response := httptest.NewRecorder()
@@ -280,7 +305,8 @@ func TestNotFoundNotSet(t *testing.T) {
 		t.Error(response.Code)
 	}
 	app.ExpectTxnMetrics(t, internal.WantTxn{
-		Name:  "NotFound",
-		IsWeb: true,
+		Name:          "NotFound",
+		IsWeb:         true,
+		UnknownCaller: true,
 	})
 }

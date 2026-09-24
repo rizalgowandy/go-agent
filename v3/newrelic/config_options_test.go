@@ -45,6 +45,14 @@ func TestConfigFromEnvironment(t *testing.T) {
 			return "456"
 		case "NEW_RELIC_INFINITE_TRACING_SPAN_EVENTS_QUEUE_SIZE":
 			return "98765"
+		case "NEW_RELIC_CODE_LEVEL_METRICS_SCOPE":
+			return "all"
+		case "NEW_RELIC_CODE_LEVEL_METRICS_PATH_PREFIX":
+			return "/foo/bar,/spam/spam/spam/frotz"
+		case "NEW_RELIC_CODE_LEVEL_METRICS_IGNORED_PREFIX":
+			return "/a/b,/c/d"
+		case "NEW_RELIC_APPLICATION_LOGGING_ENABLED":
+			return "false"
 		}
 		return ""
 	})
@@ -66,12 +74,20 @@ func TestConfigFromEnvironment(t *testing.T) {
 	expect.InfiniteTracing.TraceObserver.Host = "myhost.com"
 	expect.InfiniteTracing.TraceObserver.Port = 456
 	expect.InfiniteTracing.SpanEvents.QueueSize = 98765
+	expect.CodeLevelMetrics.Scope = AllCLM
+	expect.CodeLevelMetrics.PathPrefixes = []string{"/foo/bar", "/spam/spam/spam/frotz"}
+	expect.CodeLevelMetrics.IgnoredPrefixes = []string{"/a/b", "/c/d"}
+
+	expect.ApplicationLogging.Enabled = false
+	expect.ApplicationLogging.Forwarding.Enabled = true
+	expect.ApplicationLogging.Metrics.Enabled = true
+	expect.ApplicationLogging.LocalDecorating.Enabled = false
 
 	cfg := defaultConfig()
 	cfgOpt(&cfg)
 
 	if !reflect.DeepEqual(expect, cfg) {
-		t.Error(cfg)
+		t.Errorf("%+v", cfg)
 	}
 }
 
@@ -189,6 +205,173 @@ func TestConfigFromEnvironmentInvalidInt(t *testing.T) {
 	}
 }
 
+func TestConfigFromEnvironmentIntCases(t *testing.T) {
+	tests := []struct {
+		name     string // description of the test case
+		envVar   string // environment variable name
+		envValue string // environment variable value to set
+		want     int
+		getValue func(*Config) int // function to extract the actual value from config
+	}{
+		{
+			name:     "TraceObserver Port valid value",
+			envVar:   "NEW_RELIC_INFINITE_TRACING_TRACE_OBSERVER_PORT",
+			envValue: "8000",
+			want:     8000,
+			getValue: func(c *Config) int { return c.InfiniteTracing.TraceObserver.Port },
+		},
+		{
+			name:     "Logical Processors valid value",
+			envVar:   "NEW_RELIC_UTILIZATION_LOGICAL_PROCESSORS",
+			envValue: "123",
+			want:     123,
+			getValue: func(c *Config) int { return c.Utilization.LogicalProcessors },
+		},
+		{
+			name:     "Total RAM MiB valid value",
+			envVar:   "NEW_RELIC_UTILIZATION_TOTAL_RAM_MIB",
+			envValue: "321",
+			want:     321,
+			getValue: func(c *Config) int { return c.Utilization.TotalRAMMIB },
+		},
+		{
+			name:     "Span Events Queue Size valid value",
+			envVar:   "NEW_RELIC_INFINITE_TRACING_SPAN_EVENTS_QUEUE_SIZE",
+			envValue: "500",
+			want:     500,
+			getValue: func(c *Config) int { return c.InfiniteTracing.SpanEvents.QueueSize },
+		},
+		{
+			name:     "Application Logging Forwarding Max Samples valid value",
+			envVar:   "NEW_RELIC_APPLICATION_LOGGING_FORWARDING_MAX_SAMPLES_STORED",
+			envValue: "800",
+			want:     800,
+			getValue: func(c *Config) int { return c.ApplicationLogging.Forwarding.MaxSamplesStored },
+		},
+		{
+			name:     "Span Events Max Samples valid value",
+			envVar:   "NEW_RELIC_SPAN_EVENTS_MAX_SAMPLES_STORED",
+			envValue: "2000",
+			want:     2000,
+			getValue: func(c *Config) int { return c.SpanEvents.MaxSamplesStored },
+		},
+		{
+			name:     "Span Events Max Samples more than maximum",
+			envVar:   "NEW_RELIC_SPAN_EVENTS_MAX_SAMPLES_STORED",
+			envValue: "200000",
+			want:     2000,
+			getValue: func(c *Config) int { return c.SpanEvents.MaxSamplesStored },
+		},
+		{
+			name:     "Span Events Max Samples less than 0",
+			envVar:   "NEW_RELIC_SPAN_EVENTS_MAX_SAMPLES_STORED",
+			envValue: "-1000",
+			want:     2000,
+			getValue: func(c *Config) int { return c.SpanEvents.MaxSamplesStored },
+		},
+		// Transaction Events test cases
+		{
+			name:     "Transaction Events Max Samples valid value",
+			envVar:   "NEW_RELIC_TRANSACTION_EVENTS_MAX_SAMPLES_STORED",
+			envValue: "5000",
+			want:     5000,
+			getValue: func(c *Config) int { return c.TransactionEvents.MaxSamplesStored },
+		},
+		{
+			name:     "Transaction Events Max Samples more than maximum",
+			envVar:   "NEW_RELIC_TRANSACTION_EVENTS_MAX_SAMPLES_STORED",
+			envValue: "200000",
+			want:     10000, // internal.MaxTxnEvents
+			getValue: func(c *Config) int { return c.TransactionEvents.MaxSamplesStored },
+		},
+		{
+			name:     "Transaction Events Max Samples less than 0",
+			envVar:   "NEW_RELIC_TRANSACTION_EVENTS_MAX_SAMPLES_STORED",
+			envValue: "-500",
+			want:     10000, // internal.MaxTxnEvents
+			getValue: func(c *Config) int { return c.TransactionEvents.MaxSamplesStored },
+		},
+		// Custom Insights Events test cases
+		{
+			name:     "Custom Insights Events Max Samples valid value",
+			envVar:   "NEW_RELIC_CUSTOM_INSIGHTS_EVENTS_MAX_SAMPLES_STORED",
+			envValue: "15000",
+			want:     15000,
+			getValue: func(c *Config) int { return c.CustomInsightsEvents.MaxSamplesStored },
+		},
+		{
+			name:     "Custom Insights Events Max Samples more than maximum",
+			envVar:   "NEW_RELIC_CUSTOM_INSIGHTS_EVENTS_MAX_SAMPLES_STORED",
+			envValue: "500000",
+			want:     100000, // internal.MaxCustomEvents
+			getValue: func(c *Config) int { return c.CustomInsightsEvents.MaxSamplesStored },
+		},
+		{
+			name:     "Custom Insights Events Max Samples less than 0",
+			envVar:   "NEW_RELIC_CUSTOM_INSIGHTS_EVENTS_MAX_SAMPLES_STORED",
+			envValue: "-1500",
+			want:     100000, // internal.MaxCustomEvents
+			getValue: func(c *Config) int { return c.CustomInsightsEvents.MaxSamplesStored },
+		},
+		// Error Collector Events test cases
+		{
+			name:     "Error Collector Max Event Samples valid value",
+			envVar:   "NEW_RELIC_ERROR_COLLECTOR_MAX_EVENT_SAMPLES_STORED",
+			envValue: "50",
+			want:     50,
+			getValue: func(c *Config) int { return c.ErrorCollector.MaxSamplesStored },
+		},
+		{
+			name:     "Error Collector Max Event Samples more than maximum",
+			envVar:   "NEW_RELIC_ERROR_COLLECTOR_MAX_EVENT_SAMPLES_STORED",
+			envValue: "5000",
+			want:     100, // internal.MaxErrorEvents
+			getValue: func(c *Config) int { return c.ErrorCollector.MaxSamplesStored },
+		},
+		{
+			name:     "Error Collector Max Event Samples less than 0",
+			envVar:   "NEW_RELIC_ERROR_COLLECTOR_MAX_EVENT_SAMPLES_STORED",
+			envValue: "-50",
+			want:     100, // internal.MaxErrorEvents
+			getValue: func(c *Config) int { return c.ErrorCollector.MaxSamplesStored },
+		},
+		// Application Logging Forwarding test cases (additional beyond existing one)
+		{
+			name:     "Application Logging Forwarding Max Samples more than maximum",
+			envVar:   "NEW_RELIC_APPLICATION_LOGGING_FORWARDING_MAX_SAMPLES_STORED",
+			envValue: "50000",
+			want:     10000, // internal.MaxLogEvents
+			getValue: func(c *Config) int { return c.ApplicationLogging.Forwarding.MaxSamplesStored },
+		},
+		{
+			name:     "Application Logging Forwarding Max Samples less than 0",
+			envVar:   "NEW_RELIC_APPLICATION_LOGGING_FORWARDING_MAX_SAMPLES_STORED",
+			envValue: "-800",
+			want:     10000, // internal.MaxLogEvents
+			getValue: func(c *Config) int { return c.ApplicationLogging.Forwarding.MaxSamplesStored },
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfgOpt := configFromEnvironment(func(s string) string {
+				if s == tt.envVar {
+					return tt.envValue
+				}
+				return ""
+			})
+
+			cfg := defaultConfig()
+			cfgOpt(&cfg)
+
+			got := tt.getValue(&cfg)
+			if got != tt.want {
+				t.Errorf("got %s = %d, want %s = %d", tt.envVar, got, tt.envVar, tt.want)
+			}
+		})
+	}
+}
+
 func TestConfigFromEnvironmentInvalidLogger(t *testing.T) {
 	cfgOpt := configFromEnvironment(func(s string) string {
 		switch s {
@@ -234,5 +417,155 @@ func TestConfigFromEnvironmentLabelsSuccess(t *testing.T) {
 	cfgOpt(&cfg)
 	if !reflect.DeepEqual(cfg.Labels, map[string]string{"zip": "zap", "zop": "zup"}) {
 		t.Error(cfg.Labels)
+	}
+}
+
+func TestConfigRemoteParentSamplingDefaults(t *testing.T) {
+	cfg := defaultConfig()
+	if cfg.DistributedTracer.Sampler.RemoteParentNotSampled != "default" {
+		t.Error("incorrect config value for DistributedTracer.Sampler.RemoteParentNotSampled:", cfg.DistributedTracer.Sampler.RemoteParentNotSampled)
+	}
+	if cfg.DistributedTracer.Sampler.RemoteParentSampled != "default" {
+		t.Error("incorrect config value for DistributedTracer.Sampler.RemoteParentSampled:", cfg.DistributedTracer.Sampler.RemoteParentSampled)
+	}
+}
+
+func TestConfigRemoteParentSampledOn(t *testing.T) {
+	cfgOpt := ConfigRemoteParentSampled(AlwaysOn)
+	cfg := defaultConfig()
+	cfgOpt(&cfg)
+	if cfg.DistributedTracer.Sampler.RemoteParentSampled != "always_on" {
+		t.Error("incorrect config value for DistributedTracer.Sampler.RemoteParentSampled:", cfg.DistributedTracer.Sampler.RemoteParentSampled)
+	}
+}
+
+func TestConfigRemoteParentSampledOff(t *testing.T) {
+	cfgOpt := ConfigRemoteParentSampled(AlwaysOff)
+	cfg := defaultConfig()
+	cfgOpt(&cfg)
+	if cfg.DistributedTracer.Sampler.RemoteParentSampled != "always_off" {
+		t.Error("incorrect config value for DistributedTracer.Sampler.RemoteParentSampled:", cfg.DistributedTracer.Sampler.RemoteParentSampled)
+	}
+}
+
+func TestConfigRemoteParentNotSampledOn(t *testing.T) {
+	cfgOpt := ConfigRemoteParentNotSampled(AlwaysOn)
+	cfg := defaultConfig()
+	cfgOpt(&cfg)
+	if cfg.DistributedTracer.Sampler.RemoteParentNotSampled != "always_on" {
+		t.Error("incorrect config value for DistributedTracer.Sampler.RemoteParentNotSampled:", cfg.DistributedTracer.Sampler.RemoteParentNotSampled)
+	}
+}
+
+func TestConfigRemoteParentNotSampledOff(t *testing.T) {
+	cfgOpt := ConfigRemoteParentNotSampled(AlwaysOff)
+	cfg := defaultConfig()
+	cfgOpt(&cfg)
+	if cfg.DistributedTracer.Sampler.RemoteParentNotSampled != "always_off" {
+		t.Error("incorrect config value for DistributedTracer.Sampler.RemoteParentNotSampled:", cfg.DistributedTracer.Sampler.RemoteParentNotSampled)
+	}
+}
+
+func TestConfigEventsMaxSamplesStored(t *testing.T) {
+	// Test all event types with their MaxSamplesStored configuration
+	eventTypes := []struct {
+		name           string
+		maxLimit       int
+		configFunc     func(int) ConfigOption // specific function that we are testing
+		getConfigValue func(*Config) int      // specific config value we are setting
+	}{
+		{
+			name:           "SpanEvents",
+			maxLimit:       2000, // internal.MaxSpanEvents
+			configFunc:     ConfigSpanEventsMaxSamplesStored,
+			getConfigValue: func(c *Config) int { return c.SpanEvents.MaxSamplesStored },
+		},
+		{
+			name:           "SpanEvents (deprecated) distributed tracer reservoir limit",
+			maxLimit:       2000, // internal.MaxSpanEvents
+			configFunc:     ConfigDistributedTracerReservoirLimit,
+			getConfigValue: func(c *Config) int { return c.SpanEvents.MaxSamplesStored },
+		},
+		{
+			name:           "TransactionEvents",
+			maxLimit:       10000, // internal.MaxTxnEvents
+			configFunc:     ConfigTransactionEventsMaxSamplesStored,
+			getConfigValue: func(c *Config) int { return c.TransactionEvents.MaxSamplesStored },
+		},
+		{
+			name:           "CustomInsightsEvents",
+			maxLimit:       100000, // internal.MaxCustomEvents
+			configFunc:     ConfigCustomInsightsEventsMaxSamplesStored,
+			getConfigValue: func(c *Config) int { return c.CustomInsightsEvents.MaxSamplesStored },
+		},
+		{
+			name:           "ErrorCollector",
+			maxLimit:       100, // internal.MaxErrorEvents
+			configFunc:     ConfigErrorCollectorMaxSamplesStored,
+			getConfigValue: func(c *Config) int { return c.ErrorCollector.MaxSamplesStored },
+		},
+		{
+			name:           "ApplicationLogging",
+			maxLimit:       10000, // internal.MaxLogEvents
+			configFunc:     ConfigAppLogForwardingMaxSamplesStored,
+			getConfigValue: func(c *Config) int { return c.ApplicationLogging.Forwarding.MaxSamplesStored },
+		},
+	}
+
+	// Test cases common to all event types
+	testCases := []struct {
+		name     string
+		getLimit func(maxLimit int) int // function to get event function parameter
+		getWant  func(maxLimit int) int // function to get expected value
+	}{
+		{
+			name:     "MaxSamplesStored is less than 0",
+			getLimit: func(maxLimit int) int { return -1 },
+			getWant:  func(maxLimit int) int { return maxLimit },
+		},
+		{
+			name:     "MaxSamplesStored is greater than max",
+			getLimit: func(maxLimit int) int { return maxLimit + 1 },
+			getWant:  func(maxLimit int) int { return maxLimit },
+		},
+		{
+			name:     "MaxSamplesStored is much greater than max",
+			getLimit: func(maxLimit int) int { return maxLimit * 50 },
+			getWant:  func(maxLimit int) int { return maxLimit },
+		},
+		{
+			name:     "MaxSamplesStored is between 0 and max",
+			getLimit: func(maxLimit int) int { return maxLimit / 2 },
+			getWant:  func(maxLimit int) int { return maxLimit / 2 },
+		},
+		{
+			name:     "MaxSamplesStored is 0",
+			getLimit: func(maxLimit int) int { return 0 },
+			getWant:  func(maxLimit int) int { return 0 }, // right now all the functions return 0. This can be changed to a zeroValue in the eventTypes struct
+		},
+		{
+			name:     "MaxSamplesStored is equal to max",
+			getLimit: func(maxLimit int) int { return maxLimit },
+			getWant:  func(maxLimit int) int { return maxLimit },
+		},
+	}
+
+	for _, eventType := range eventTypes {
+		t.Run(eventType.name, func(t *testing.T) {
+			for _, tt := range testCases {
+				limit := tt.getLimit(eventType.maxLimit) //
+				want := tt.getWant(eventType.maxLimit)
+
+				t.Run(tt.name, func(t *testing.T) {
+					cfgOpt := eventType.configFunc(limit)
+					cfg := defaultConfig()
+					cfgOpt(&cfg)
+					got := eventType.getConfigValue(&cfg)
+					if got != want {
+						t.Errorf("%s.MaxSamplesStored = %v, want %v", eventType.name, got, want)
+					}
+				})
+			}
+		})
 	}
 }

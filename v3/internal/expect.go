@@ -22,8 +22,19 @@ type WantError struct {
 	TxnName         string
 	Msg             string
 	Klass           string
+	GUID            string
 	UserAttributes  map[string]interface{}
 	AgentAttributes map[string]interface{}
+}
+
+// WantLog is a traced log event expectation
+type WantLog struct {
+	Attributes map[string]interface{}
+	Severity   string
+	Message    string
+	SpanID     string
+	TraceID    string
+	Timestamp  int64
 }
 
 func uniquePointer() *struct{} {
@@ -36,6 +47,8 @@ var (
 	MatchAnything = uniquePointer()
 	// MatchAnyString is a placeholder for matching any string
 	MatchAnyString = "xxANY-STRINGxx"
+	// MatchAnyUnixMilli is a placeholder for matching any unix millisecond timestamp int64
+	MatchAnyUnixMilli = int64(-1)
 )
 
 // WantEvent is a transaction or error event expectation.
@@ -101,15 +114,18 @@ func HarvestTesting(app interface{}, replyfn func(*ConnectReply)) {
 
 // WantTxn provides the expectation parameters to ExpectTxnMetrics.
 type WantTxn struct {
-	Name      string
-	IsWeb     bool
-	NumErrors int
+	Name          string
+	IsWeb         bool
+	NumErrors     int
+	UnknownCaller bool
+	ErrorByCaller bool
 }
 
 // Expect exposes methods that allow for testing whether the correct data was
 // captured.
 type Expect interface {
 	ExpectCustomEvents(t Validator, want []WantEvent)
+	ExpectLogEvents(t Validator, want []WantLog)
 	ExpectErrors(t Validator, want []WantError)
 	ExpectErrorEvents(t Validator, want []WantEvent)
 

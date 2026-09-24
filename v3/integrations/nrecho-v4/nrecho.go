@@ -35,37 +35,77 @@ func handlerPointer(handler echo.HandlerFunc) uintptr {
 	return reflect.ValueOf(handler).Pointer()
 }
 
-func transactionName(c echo.Context) string {
+func transactionName(c echo.Context) (string, string) {
 	ptr := handlerPointer(c.Handler())
 	if ptr == handlerPointer(echo.NotFoundHandler) {
-		return "NotFoundHandler"
+		return "NotFoundHandler", ""
 	}
 	if ptr == handlerPointer(echo.MethodNotAllowedHandler) {
-		return "MethodNotAllowedHandler"
+		return "MethodNotAllowedHandler", ""
 	}
-	return c.Request().Method + " " + c.Path()
+	return c.Request().Method + " " + c.Path(), c.Path()
 }
 
-// Middleware creates Echo middleware that instruments requests.
+// Skipper defines a function to skip middleware. Returning true skips processing
+// the middleware.
+type Skipper func(c echo.Context) bool
+
+// Config defines the config for the middleware.
+type Config struct {
+	// App contains newrelic application.
+	App *newrelic.Application
+
+	// Skipper defines a function to skip middleware.
+	Skipper Skipper
+}
+
+type ConfigOption func(*Config)
+
+func WithSkipper(skipper Skipper) ConfigOption {
+	return func(cfg *Config) { cfg.Skipper = skipper }
+}
+
+// Middleware creates Echo middleware with provided config that
+// instruments requests.
 //
 //	e := echo.New()
 //	// Add the nrecho middleware before other middlewares or routes:
-//	e.Use(nrecho.Middleware(app))
-//
-func Middleware(app *newrelic.Application) func(echo.HandlerFunc) echo.HandlerFunc {
-
-	if nil == app {
+//	e.Use(nrecho.MiddlewareWithConfig(nrecho.Config{App: app}))
+func Middleware(app *newrelic.Application, opts ...ConfigOption) func(echo.HandlerFunc) echo.HandlerFunc {
+	if app == nil {
 		return func(next echo.HandlerFunc) echo.HandlerFunc {
 			return next
 		}
 	}
 
+	config := Config{
+		App: app,
+	}
+
+	for _, opt := range opts {
+		opt(&config)
+	}
+
+	if config.Skipper == nil {
+		// set default skipper
+		config.Skipper = func(echo.Context) bool {
+			return false
+		}
+	}
+
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c echo.Context) (err error) {
-			rw := c.Response().Writer
-			txn := app.StartTransaction(transactionName(c))
-			defer txn.End()
+			if config.Skipper(c) {
+				return next(c)
+			}
 
+			rw := c.Response().Writer
+			tname, path := transactionName(c)
+			txn := config.App.StartTransaction(tname)
+			defer txn.End()
+			if newrelic.IsSecurityAgentPresent() {
+				txn.SetCsecAttributes(newrelic.AttributeCsecRoute, path)
+			}
 			txn.SetWebRequestHTTP(c.Request())
 
 			c.Response().Writer = txn.SetWebResponse(rw)
@@ -87,9 +127,32 @@ func Middleware(app *newrelic.Application) func(echo.HandlerFunc) echo.HandlerFu
 				} else {
 					txn.SetWebResponse(nil).WriteHeader(http.StatusInternalServerError)
 				}
+				if newrelic.IsSecurityAgentPresent() {
+					newrelic.GetSecurityAgentInterface().SendEvent("RESPONSE_HEADER", c.Response().Header(), txn.GetLinkingMetadata().TraceID)
+				}
 			}
 
 			return
+		}
+	}
+}
+
+// WrapRouter extracts API endpoints from the echo instance passed to it
+// which is used to detect application URL mapping(api-endpoints) for provable security.
+// In this version of the integration, this wrapper is only necessary if you are using the New Relic security agent integration [https://github.com/newrelic/go-agent/tree/master/v3/integrations/nrsecurityagent],
+// but it may be enhanced to provide additional functionality in future releases.
+//
+//	 e := echo.New()
+//	 ....
+//	 ....
+//	 ....
+//
+//	nrecho.WrapRouter(e)
+func WrapRouter(engine *echo.Echo) {
+	if engine != nil && newrelic.IsSecurityAgentPresent() {
+		router := engine.Routes()
+		for _, r := range router {
+			newrelic.GetSecurityAgentInterface().SendEvent("API_END_POINTS", r.Path, r.Method, r.Name)
 		}
 	}
 }

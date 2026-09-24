@@ -1,17 +1,22 @@
 module github.com/newrelic/go-agent/v3/integrations/nrpq
 
-// As of Dec 2019, go 1.11 is the earliest version of Go tested by lib/pq:
-// https://github.com/lib/pq/blob/master/.travis.yml
-go 1.11
+go 1.25.0
 
 require (
 	// NewConnector dsn parsing tests expect v1.1.0 error return behavior.
 	github.com/lib/pq v1.1.0
 	// v3.3.0 includes the new location of ParseQuery
-	github.com/newrelic/go-agent/v3 v3.3.0
-	google.golang.org/grpc v1.27.0 // indirect
+	github.com/newrelic/go-agent/v3 v3.45.0
 )
 
-replace github.com/newrelic/go-agent/v3 v3.3.0 => ../../../v3
+require (
+	github.com/google/pprof v0.0.0-20260802141513-ef3492d7dac3 // indirect
+	golang.org/x/net v0.55.0 // indirect
+	golang.org/x/sys v0.45.0 // indirect
+	golang.org/x/text v0.37.0 // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20260526163538-3dc84a4a5aaa // indirect
+	google.golang.org/grpc v1.83.1 // indirect
+	google.golang.org/protobuf v1.36.11 // indirect
+)
 
-replace github.com/newrelic/go-agent/v3/newrelic => ../../../v3/newrelic
+replace github.com/newrelic/go-agent/v3 => ../..

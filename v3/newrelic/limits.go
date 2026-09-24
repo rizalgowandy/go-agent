@@ -36,14 +36,13 @@ const (
 	maxSyntheticsTraces = 20
 	maxHarvestErrors    = 20
 	maxHarvestSlowSQLs  = 10
-	// maxSpanEvents is the maximum number of Span Events that can be captured
-	// per 60-second harvest cycle
-	maxSpanEvents = 1000
 
+	errorEventMessageLengthLimit = 4096
 	// attributes
-	attributeKeyLengthLimit   = 255
-	attributeValueLengthLimit = 255
-	attributeUserLimit        = 64
+	attributeKeyLengthLimit       = 255
+	attributeValueLengthLimit     = 255
+	attributeUserLimit            = 64
+	attributeSpanDBStatementLimit = 4096 // int representing max db.statement size in bytes
 	// attributeErrorLimit limits the number of extra attributes that can be
 	// provided when noticing an error.
 	attributeErrorLimit       = 32

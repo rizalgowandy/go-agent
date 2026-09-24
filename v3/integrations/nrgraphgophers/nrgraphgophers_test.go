@@ -15,8 +15,8 @@ import (
 	"github.com/graph-gophers/graphql-go/introspection"
 	"github.com/graph-gophers/graphql-go/relay"
 	"github.com/newrelic/go-agent/v3/internal"
-	"github.com/newrelic/go-agent/v3/internal/integrationsupport"
 	"github.com/newrelic/go-agent/v3/newrelic"
+	"github.com/newrelic/go-agent/v3/newrelic/integrationsupport"
 )
 
 func TestFieldManagementSync(t *testing.T) {
@@ -112,6 +112,8 @@ func TestQueryWithAsyncFields(t *testing.T) {
 		{Name: "Custom/field2", Scope: "WebTransaction/Go/hello"},
 		{Name: "Custom/field1"},
 		{Name: "Custom/field1", Scope: "WebTransaction/Go/hello"},
+		{Name: "DurationByCaller/Unknown/Unknown/Unknown/Unknown/all", Forced: nil},
+		{Name: "DurationByCaller/Unknown/Unknown/Unknown/Unknown/allWeb", Forced: nil},
 	})
 }
 
@@ -166,6 +168,8 @@ func TestQueryRequest(t *testing.T) {
 		{Name: "Custom/HelloOperation", Scope: "WebTransaction/Go/POST /"},
 		{Name: "Custom/hello"},
 		{Name: "Custom/hello", Scope: "WebTransaction/Go/POST /"},
+		{Name: "DurationByCaller/Unknown/Unknown/Unknown/Unknown/all", Forced: nil},
+		{Name: "DurationByCaller/Unknown/Unknown/Unknown/Unknown/allWeb", Forced: nil},
 	})
 }
 
@@ -202,6 +206,8 @@ func TestQueryRequestUnknownOperation(t *testing.T) {
 		{Name: "Custom/HelloOperation", Scope: "WebTransaction/Go/POST /"},
 		{Name: "Custom/hello"},
 		{Name: "Custom/hello", Scope: "WebTransaction/Go/POST /"},
+		{Name: "DurationByCaller/Unknown/Unknown/Unknown/Unknown/all", Forced: nil},
+		{Name: "DurationByCaller/Unknown/Unknown/Unknown/Unknown/allWeb", Forced: nil},
 	})
 }
 
@@ -240,11 +246,14 @@ func TestQueryRequestError(t *testing.T) {
 		{Name: "Errors/all"},
 		{Name: "Errors/allWeb"},
 		{Name: "Errors/WebTransaction/Go/POST /"},
+		{Name: "DurationByCaller/Unknown/Unknown/Unknown/Unknown/all", Forced: nil},
+		{Name: "DurationByCaller/Unknown/Unknown/Unknown/Unknown/allWeb", Forced: nil},
+		{Name: "ErrorsByCaller/Unknown/Unknown/Unknown/Unknown/all"},
+		{Name: "ErrorsByCaller/Unknown/Unknown/Unknown/Unknown/allWeb"},
 	})
 	app.ExpectErrors(t, []internal.WantError{{
 		TxnName: "WebTransaction/Go/POST /",
 		Msg:     "graphql: something went wrong",
-		Klass:   "*errors.QueryError",
 	}})
 }
 
@@ -282,5 +291,7 @@ func TestQueryRequestMultipleFields(t *testing.T) {
 		{Name: "Custom/zip", Scope: "WebTransaction/Go/POST /"},
 		{Name: "Custom/zap"},
 		{Name: "Custom/zap", Scope: "WebTransaction/Go/POST /"},
+		{Name: "DurationByCaller/Unknown/Unknown/Unknown/Unknown/all", Forced: nil},
+		{Name: "DurationByCaller/Unknown/Unknown/Unknown/Unknown/allWeb", Forced: nil},
 	})
 }

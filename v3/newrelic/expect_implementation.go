@@ -4,16 +4,22 @@
 package newrelic
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"time"
 
 	"github.com/newrelic/go-agent/v3/internal"
 )
 
-func validateStringField(v internal.Validator, fieldName, v1, v2 string) {
-	if v1 != v2 {
-		v.Error(fieldName, v1, v2)
+func validateStringField(v internal.Validator, fieldName, expect, actual string) {
+	// If an expected value is not set, we assume the user does not want to validate it
+	if expect == "" {
+		return
+	}
+	if expect != actual {
+		v.Error(fieldName, "incorrect: Expected:", expect, " Got:", actual)
 	}
 }
 
@@ -52,6 +58,22 @@ func expectTxnMetrics(t internal.Validator, mt *metricTable, want internal.WantT
 			{Name: "Apdex", Scope: "", Forced: true, Data: nil},
 			{Name: "Apdex/Go/" + want.Name, Scope: "", Forced: false, Data: nil},
 		}
+		if want.UnknownCaller {
+			metrics = append(metrics,
+				internal.WantMetric{Name: "DurationByCaller/Unknown/Unknown/Unknown/Unknown/all", Scope: "", Forced: false, Data: nil},
+			)
+			metrics = append(metrics,
+				internal.WantMetric{Name: "DurationByCaller/Unknown/Unknown/Unknown/Unknown/allWeb", Scope: "", Forced: false, Data: nil},
+			)
+		}
+		if want.ErrorByCaller {
+			metrics = append(metrics,
+				internal.WantMetric{Name: "ErrorsByCaller/Unknown/Unknown/Unknown/Unknown/allWeb", Scope: "", Forced: false, Data: nil},
+			)
+			metrics = append(metrics,
+				internal.WantMetric{Name: "ErrorsByCaller/Unknown/Unknown/Unknown/Unknown/all", Scope: "", Forced: false, Data: nil},
+			)
+		}
 	} else {
 		scope = "OtherTransaction/Go/" + want.Name
 		allWebOther = "allOther"
@@ -60,6 +82,22 @@ func expectTxnMetrics(t internal.Validator, mt *metricTable, want internal.WantT
 			{Name: "OtherTransaction/all", Scope: "", Forced: true, Data: nil},
 			{Name: "OtherTransactionTotalTime/Go/" + want.Name, Scope: "", Forced: false, Data: nil},
 			{Name: "OtherTransactionTotalTime", Scope: "", Forced: true, Data: nil},
+		}
+		if want.UnknownCaller {
+			metrics = append(metrics,
+				internal.WantMetric{Name: "DurationByCaller/Unknown/Unknown/Unknown/Unknown/all", Scope: "", Forced: false, Data: nil},
+			)
+			metrics = append(metrics,
+				internal.WantMetric{Name: "DurationByCaller/Unknown/Unknown/Unknown/Unknown/allOther", Scope: "", Forced: false, Data: nil},
+			)
+		}
+		if want.ErrorByCaller {
+			metrics = append(metrics,
+				internal.WantMetric{Name: "ErrorsByCaller/Unknown/Unknown/Unknown/Unknown/allOther", Scope: "", Forced: false, Data: nil},
+			)
+			metrics = append(metrics,
+				internal.WantMetric{Name: "ErrorsByCaller/Unknown/Unknown/Unknown/Unknown/all", Scope: "", Forced: false, Data: nil},
+			)
 		}
 	}
 	if want.NumErrors > 0 {
@@ -73,9 +111,9 @@ func expectTxnMetrics(t internal.Validator, mt *metricTable, want internal.WantT
 	expectMetrics(t, mt, metrics)
 }
 
-func expectMetricField(t internal.Validator, id metricID, v1, v2 float64, fieldName string) {
-	if v1 != v2 {
-		t.Error("metric fields do not match", id, v1, v2, fieldName)
+func expectMetricField(t internal.Validator, id metricID, expect, want float64, fieldName string) {
+	if expect != want {
+		t.Error("incorrect value for metric", fieldName, id, "expect:", expect, "want: ", want)
 	}
 }
 
@@ -92,7 +130,7 @@ func expectMetrics(t internal.Validator, mt *metricTable, expect []internal.Want
 func expectMetricsInternal(t internal.Validator, mt *metricTable, expect []internal.WantMetric, exactMatch bool) {
 	if exactMatch {
 		if len(mt.metrics) != len(expect) {
-			t.Error("metric counts do not match expectations", len(mt.metrics), len(expect))
+			t.Error("incorrect number of metrics stored, expected:", len(expect), "got:", len(mt.metrics))
 		}
 	}
 	expectedIds := make(map[metricID]struct{})
@@ -101,7 +139,7 @@ func expectMetricsInternal(t internal.Validator, mt *metricTable, expect []inter
 		expectedIds[id] = struct{}{}
 		m := mt.metrics[id]
 		if nil == m {
-			t.Error("unable to find metric", id)
+			t.Error("expected metric not found", id)
 			continue
 		}
 
@@ -138,19 +176,31 @@ func expectAttributes(v internal.Validator, exists map[string]interface{}, expec
 	if len(exists) != len(expect) {
 		v.Error("attributes length difference", len(exists), len(expect))
 	}
-	for key, val := range expect {
-		found, ok := exists[key]
+	for key, expectVal := range expect {
+		actualVal, ok := exists[key]
 		if !ok {
 			v.Error("expected attribute not found: ", key)
 			continue
 		}
-		if val == internal.MatchAnything {
+		if expectVal == internal.MatchAnything || expectVal == "*" {
 			continue
 		}
-		v1 := fmt.Sprint(found)
-		v2 := fmt.Sprint(val)
-		if v1 != v2 {
-			v.Error("value difference", fmt.Sprintf("key=%s", key), v1, v2)
+
+		actualString := fmt.Sprint(actualVal)
+		expectString := fmt.Sprint(expectVal)
+		switch expectVal.(type) {
+		case float64:
+			// json.Number type objects need to be converted into float64 strings
+			// when compared against a float64 or the comparison will fail due to
+			// the number formatting being different
+			if number, ok := actualVal.(json.Number); ok {
+				numString, _ := number.Float64()
+				actualString = fmt.Sprint(numString)
+			}
+		}
+
+		if expectString != actualString {
+			v.Error(fmt.Sprintf("Values of key \"%s\" do not match; Expect: %s Actual: %s", key, expectString, actualString))
 		}
 	}
 	for key, val := range exists {
@@ -167,18 +217,93 @@ func expectCustomEvents(v internal.Validator, cs *customEvents, expect []interna
 	expectEvents(v, cs.analyticsEvents, expect, nil)
 }
 
+func expectLogEvents(v internal.Validator, events *logEvents, expect []internal.WantLog) {
+	if len(events.logs) != len(expect) {
+		v.Error("actual number of events does not match what is expected", len(events.logs), len(expect))
+		return
+	}
+
+	for i, e := range expect {
+		event := events.logs[i]
+		expectLogEvent(v, event, e)
+	}
+}
+
+func expectLogEvent(v internal.Validator, actual logEvent, want internal.WantLog) {
+	if actual.message != want.Message && want.Message != internal.MatchAnyString {
+		v.Error(fmt.Sprintf("unexpected log message: got %s, want %s", actual.message, want.Message))
+		return
+	}
+	if actual.severity != want.Severity && want.Severity != internal.MatchAnyString {
+		v.Error(fmt.Sprintf("unexpected log severity: got %s, want %s", actual.severity, want.Severity))
+		return
+	}
+	if actual.traceID != want.TraceID && want.TraceID != internal.MatchAnyString {
+		v.Error(fmt.Sprintf("unexpected log trace id: got %s, want %s", actual.traceID, want.TraceID))
+		return
+	}
+	if actual.spanID != want.SpanID && want.SpanID != internal.MatchAnyString {
+		v.Error(fmt.Sprintf("unexpected log span id: got %s, want %s", actual.spanID, want.SpanID))
+		return
+	}
+	if actual.timestamp != want.Timestamp && want.Timestamp != internal.MatchAnyUnixMilli {
+		v.Error(fmt.Sprintf("unexpected log timestamp: got %d, want %d", actual.timestamp, want.Timestamp))
+		return
+	}
+
+	if actual.attributes != nil && want.Attributes != nil {
+		if len(actual.attributes) != len(want.Attributes) {
+			skippedAttributes := []string{}
+			for k := range actual.attributes {
+				if _, ok := want.Attributes[k]; !ok {
+					skippedAttributes = append(skippedAttributes, fmt.Sprintf("an expected attribute is missing: {\"%s\":%v}", k, actual.attributes[k]))
+				}
+			}
+			for k := range want.Attributes {
+				if _, ok := actual.attributes[k]; !ok {
+					skippedAttributes = append(skippedAttributes, fmt.Sprintf("unexpected attribute: {\"%s\":%v}", k, want.Attributes[k]))
+				}
+			}
+			v.Error(fmt.Sprintf("unexpected number of log attributes: got %d, want %d; %s", len(actual.attributes), len(want.Attributes), skippedAttributes))
+			return
+		} else {
+			for k, wantVal := range want.Attributes {
+				actualVal := actual.attributes[k]
+				ok := reflect.DeepEqual(wantVal, actualVal)
+				if !ok {
+					v.Error(fmt.Sprintf("unexpected log attribute for key \"%s\": got value: %+v, type: %T; want value: %+v, type: %T", k, actualVal, actualVal, wantVal, wantVal))
+					return
+				}
+			}
+		}
+	}
+}
+
 func expectEvent(v internal.Validator, e json.Marshaler, expect internal.WantEvent) {
 	js, err := e.MarshalJSON()
 	if nil != err {
 		v.Error("unable to marshal event", err)
 		return
 	}
+
+	// Because we are unmarshaling into a generic struct without types
+	// JSON numbers will be set to the float64 type by default, causing
+	// errors when comparing to the expected integer timestamp value.
+	decoder := json.NewDecoder(bytes.NewReader(js))
+	decoder.UseNumber()
 	var event []map[string]interface{}
-	err = json.Unmarshal(js, &event)
+	err = decoder.Decode(&event)
 	if nil != err {
 		v.Error("unable to parse event json", err)
 		return
 	}
+
+	// avoid nil pointer errors or index out of bounds errors
+	if event == nil || len(event) == 0 {
+		v.Error("Event can not be nil or empty")
+		return
+	}
+
 	intrinsics := event[0]
 	userAttributes := event[1]
 	agentAttributes := event[2]
@@ -442,13 +567,13 @@ func expectSlowQuery(t internal.Validator, slowQuery *slowQuery, want internal.W
 		t.Error("wrong Count field", slowQuery.Count, want.Count)
 	}
 	uri, _ := slowQuery.txnEvent.Attrs.GetAgentValue(AttributeRequestURI, destTxnTrace)
-	validateStringField(t, "MetricName", slowQuery.DatastoreMetric, want.MetricName)
-	validateStringField(t, "Query", slowQuery.ParameterizedQuery, want.Query)
-	validateStringField(t, "TxnEvent.FinalName", slowQuery.txnEvent.FinalName, want.TxnName)
-	validateStringField(t, "request.uri", uri, want.TxnURL)
-	validateStringField(t, "DatabaseName", slowQuery.DatabaseName, want.DatabaseName)
-	validateStringField(t, "Host", slowQuery.Host, want.Host)
-	validateStringField(t, "PortPathOrID", slowQuery.PortPathOrID, want.PortPathOrID)
+	validateStringField(t, "MetricName", want.MetricName, slowQuery.DatastoreMetric)
+	validateStringField(t, "Query", want.Query, slowQuery.ParameterizedQuery)
+	validateStringField(t, "TxnEvent.FinalName", want.TxnName, slowQuery.txnEvent.FinalName)
+	validateStringField(t, "request.uri", want.TxnURL, uri)
+	validateStringField(t, "DatabaseName", want.DatabaseName, slowQuery.DatabaseName)
+	validateStringField(t, "Host", want.Host, slowQuery.Host)
+	validateStringField(t, "PortPathOrID", want.PortPathOrID, slowQuery.PortPathOrID)
 	expectAttributes(t, map[string]interface{}(slowQuery.QueryParameters), want.Params)
 }
 
